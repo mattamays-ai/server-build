@@ -56,7 +56,7 @@ jobs:
             c = YAML.load_file("smartdj-addon/config.yaml")
             abort "unexpected app slug" unless c["slug"] == "music_assistant_smartdj"
             abort "missing app version" unless c["version"].is_a?(String) && !c["version"].empty?
-            abort "missing image" unless c["image"] == "ghcr.io/mattamays-ai/server"
+            abort "missing image" unless c["image"] == "ghcr.io/mattamays-ai/server-build"
             abort "amd64 support missing" unless c["arch"].include?("amd64")
             abort "aarch64 support missing" unless c["arch"].include?("aarch64")
           '
