@@ -43,7 +43,7 @@ dependencies = [
   "librosa==1.0.0",
   "numpy==2.3.5", # numpy 2.4.0+ uses X86_V2 CPU baseline (requires SSE4.2) which breaks older CPUs https://github.com/music-assistant/support/issues/5005#issuecomment-3972476728
   "torch==2.13.0",
-  "torchaudio==2.11.0",
+  "torchaudio==2.11.0+cpu",
   # stems ducking (smart_fades/stems.py): MDX-Net inference; imported lazily,
   # feature degrades to None when absent. 1.31.0 is the first line with cp314 wheels.
   "onnxruntime==1.31.0",
