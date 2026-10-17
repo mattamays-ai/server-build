@@ -1,0 +1,491 @@
+"""
+Helper module for parsing the Youtube Music API.
+
+This helpers file is an async wrapper around the excellent ytmusicapi package.
+While the ytmusicapi package does an excellent job at parsing the Youtube Music results,
+it is unfortunately not async, which is required for Music Assistant to run smoothly.
+This also nicely separates the parsing logic from the Youtube Music provider logic.
+"""
+
+import asyncio
+from collections.abc import Callable
+from http.cookies import SimpleCookie
+from time import time
+from typing import Any, Literal
+
+import ytmusicapi
+from music_assistant_models.errors import LoginFailed
+from ytmusicapi import LikeStatus
+from ytmusicapi.exceptions import YTMusicError
+
+from music_assistant.providers.ytmusic.constants import YTMRecommendationIcons
+
+# subset of ytmusicapi's accepted search filters that we use
+YTMSearchFilter = Literal["artists", "albums", "songs", "playlists", "podcasts"]
+
+
+async def get_artist(
+    prov_artist_id: str, headers: dict[str, str], language: str = "en"
+) -> dict[str, Any]:
+    """Async wrapper around the ytmusicapi get_artist function."""
+
+    def _get_artist() -> dict[str, Any]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language)
+        try:
+            artist = ytm.get_artist(channelId=prov_artist_id)
+            # ChannelId can sometimes be different and original ID is not part of the response
+            artist["channelId"] = prov_artist_id
+        except KeyError as err:
+            _raise_if_signed_out(err)
+            try:
+                user = ytm.get_user(channelId=prov_artist_id)
+                artist = {"channelId": prov_artist_id, "name": user["name"]}
+            except KeyError as err:
+                _raise_if_signed_out(err)
+                artist = {"channelId": prov_artist_id, "name": "Unknown"}
+        return artist
+
+    return await _run_ytmusic(_get_artist)
+
+
+async def get_artist_albums(
+    channel_id: str,
+    params: str,
+    headers: dict[str, str],
+    language: str = "en",
+    user: str | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Async wrapper around the ytmusicapi get_artist_albums function.
+
+    :param channel_id: The browseId of an artist section (albums/singles/shows).
+    :param params: The params value from that same section, paired with channel_id.
+    :param headers: Auth headers for the YTMusic client.
+    :param language: Response language.
+    :param user: Optional YTMusic brand-account user id.
+    """
+
+    def _get_artist_albums() -> list[dict[str, Any]]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+        return ytm.get_artist_albums(channelId=channel_id, params=params, limit=None)
+
+    return await _run_ytmusic(_get_artist_albums)
+
+
+async def get_album(
+    headers: dict[str, str], prov_album_id: str, language: str = "en", user: str | None = None
+) -> dict[str, Any]:
+    """Async wrapper around the ytmusicapi get_album function."""
+
+    def _get_album() -> dict[str, Any]:
+        if prov_album_id.startswith("FEmusic_library_privately_owned_release"):
+            ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+            album = ytm.get_library_upload_album(browseId=prov_album_id)
+        else:
+            ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+            album = ytm.get_album(browseId=prov_album_id)
+
+        if album.get("audioPlaylistId"):
+            # Track id's from album tracks do not match with actual album tracks. E.g. a track
+            # points to the videoId of the original version, while we want the album version
+            try:
+                album_playlist = ytm.get_playlist(playlistId=album["audioPlaylistId"], limit=None)
+            except YTMusicError:
+                return album
+
+            # Do some basic checks
+            if len(album_playlist.get("tracks", [])) != len(album.get("tracks", [])):
+                return album
+            # Move the correct track info to the album tracks
+            playlist_tracks_by_title = {t.get("title"): t for t in album_playlist.get("tracks", [])}
+            for album_track in album.get("tracks", []):
+                if playlist_track := playlist_tracks_by_title.get(album_track.get("title")):
+                    album_track["videoId"] = playlist_track["videoId"]
+                    album_track["isAvailable"] = playlist_track.get("isAvailable", True)
+                    album_track["likeStatus"] = playlist_track.get("likeStatus", "INDIFFERENT")
+        return album
+
+    return await _run_ytmusic(_get_album)
+
+
+async def get_playlist(
+    prov_playlist_id: str,
+    headers: dict[str, str],
+    language: str = "en",
+    user: str | None = None,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    """Async wrapper around the ytmusicapi get_playlist function."""
+
+    def _get_playlist() -> dict[str, Any]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+        playlist = ytm.get_playlist(playlistId=prov_playlist_id, limit=limit)
+        playlist["checksum"] = get_playlist_checksum(playlist)
+        # Fix missing playlist id in some edge cases
+        playlist["id"] = prov_playlist_id if not playlist.get("id") else playlist["id"]
+        return playlist
+
+    return await _run_ytmusic(_get_playlist)
+
+
+async def get_track(
+    prov_track_id: str, headers: dict[str, str], language: str = "en"
+) -> dict[str, Any] | None:
+    """Async wrapper around the ytmusicapi get_playlist function."""
+
+    def _get_song() -> dict[str, Any] | None:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language)
+        track_obj = ytm.get_song(videoId=prov_track_id)
+        track: dict[str, Any] = {}
+        if "videoDetails" not in track_obj:
+            # video that no longer exists
+            return None
+        track["videoId"] = track_obj["videoDetails"]["videoId"]
+        track["title"] = track_obj["videoDetails"]["title"]
+        track["artists"] = [
+            {
+                "channelId": track_obj["videoDetails"]["channelId"],
+                "name": track_obj["videoDetails"]["author"],
+            }
+        ]
+        track["duration"] = track_obj["videoDetails"]["lengthSeconds"]
+        track["thumbnails"] = track_obj["microformat"]["microformatDataRenderer"]["thumbnail"][
+            "thumbnails"
+        ]
+        if track_thumbs := track_obj["videoDetails"].get("thumbnail", {}).get("thumbnails"):
+            track["thumbnails"] = track.get("thumbnails", []) + track_thumbs
+        track["isAvailable"] = track_obj["playabilityStatus"]["status"] == "OK"
+        return track
+
+    return await _run_ytmusic(_get_song)
+
+
+async def get_podcast(
+    prov_podcast_id: str, headers: dict[str, str], language: str = "en"
+) -> dict[str, Any]:
+    """Async wrapper around the get_podcast function."""
+
+    def _get_podcast() -> dict[str, Any]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language)
+        podcast_obj = ytm.get_podcast(playlistId=prov_podcast_id)
+        if "podcastId" not in podcast_obj:
+            podcast_obj["podcastId"] = prov_podcast_id
+        return podcast_obj
+
+    return await _run_ytmusic(_get_podcast)
+
+
+async def get_podcast_episode(
+    prov_episode_id: str, headers: dict[str, str], language: str = "en"
+) -> dict[str, Any]:
+    """Async wrapper around the podcast episode function."""
+
+    def _get_podcast_episode() -> dict[str, Any]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language)
+        episode = ytm.get_episode(videoId=prov_episode_id)
+        if "videoId" not in episode:
+            episode["videoId"] = prov_episode_id
+        return episode
+
+    return await _run_ytmusic(_get_podcast_episode)
+
+
+async def get_library_artists(
+    headers: dict[str, str], language: str = "en", user: str | None = None
+) -> list[dict[str, Any]]:
+    """Async wrapper around the ytmusicapi get_library_artists function."""
+
+    def _get_library_artists() -> list[dict[str, Any]]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+        artists = ytm.get_library_subscriptions(limit=9999)
+        # Sync properties with uniformal artist object
+        for artist in artists:
+            artist["id"] = artist["browseId"]
+            artist["name"] = artist["artist"]
+            del artist["browseId"]
+            del artist["artist"]
+        return artists
+
+    return await _run_ytmusic(_get_library_artists)
+
+
+async def get_library_albums(
+    headers: dict[str, str], language: str = "en", user: str | None = None
+) -> list[dict[str, Any]]:
+    """Async wrapper around the ytmusicapi get_library_albums function."""
+
+    def _get_library_albums() -> list[dict[str, Any]]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+        return ytm.get_library_albums(limit=9999)
+
+    return await _run_ytmusic(_get_library_albums)
+
+
+async def get_library_playlists(
+    headers: dict[str, str], language: str = "en", user: str | None = None
+) -> list[dict[str, Any]]:
+    """Async wrapper around the ytmusicapi get_library_playlists function."""
+
+    def _get_library_playlists() -> list[dict[str, Any]]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+        playlists = ytm.get_library_playlists(limit=9999)
+        # Sync properties with uniformal playlist object
+        for playlist in playlists:
+            playlist["id"] = playlist["playlistId"]
+            del playlist["playlistId"]
+            playlist["checksum"] = get_playlist_checksum(playlist)
+        return playlists
+
+    return await _run_ytmusic(_get_library_playlists)
+
+
+async def get_library_tracks(
+    headers: dict[str, str], language: str = "en", user: str | None = None
+) -> list[dict[str, Any]]:
+    """Async wrapper around the ytmusicapi get_library_tracks function."""
+
+    def _get_library_tracks() -> list[dict[str, Any]]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+        return ytm.get_library_songs(limit=9999)
+
+    return await _run_ytmusic(_get_library_tracks)
+
+
+async def get_library_podcasts(
+    headers: dict[str, str], language: str = "en", user: str | None = None
+) -> list[dict[str, Any]]:
+    """Async wrapper around the ytmusic api get_library_podcasts function."""
+
+    def _get_library_podcasts() -> list[dict[str, Any]]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+        return ytm.get_library_podcasts(limit=9999)
+
+    return await _run_ytmusic(_get_library_podcasts)
+
+
+async def library_add_remove_artist(
+    headers: dict[str, str], prov_artist_id: str, add: bool = True, user: str | None = None
+) -> bool:
+    """Add or remove an artist to the user's library."""
+
+    def _library_add_remove_artist() -> bool:
+        ytm = ytmusicapi.YTMusic(auth=headers, user=user)
+        if add:
+            return "actions" in ytm.subscribe_artists(channelIds=[prov_artist_id])
+        return "actions" in ytm.unsubscribe_artists(channelIds=[prov_artist_id])
+
+    return await _run_ytmusic(_library_add_remove_artist)
+
+
+async def library_add_remove_album(
+    headers: dict[str, str], prov_item_id: str, add: bool = True, user: str | None = None
+) -> dict[str, Any]:
+    """Add or remove an album or playlist to the user's library."""
+    album = await get_album(headers=headers, prov_album_id=prov_item_id, user=user)
+
+    def _library_add_remove_album() -> dict[str, Any]:
+        ytm = ytmusicapi.YTMusic(auth=headers, user=user)
+        playlist_id = album["audioPlaylistId"]
+        if add:
+            return ytm.rate_playlist(playlist_id, LikeStatus.LIKE)
+        return ytm.rate_playlist(playlist_id, LikeStatus.INDIFFERENT)
+
+    return await _run_ytmusic(_library_add_remove_album)
+
+
+async def library_add_remove_playlist(
+    headers: dict[str, str], prov_item_id: str, add: bool = True, user: str | None = None
+) -> bool:
+    """Add or remove an album or playlist to the user's library."""
+
+    def _library_add_remove_playlist() -> bool:
+        ytm = ytmusicapi.YTMusic(auth=headers, user=user)
+        if add:
+            return "actions" in ytm.rate_playlist(prov_item_id, LikeStatus.LIKE)
+        return "actions" in ytm.rate_playlist(prov_item_id, LikeStatus.INDIFFERENT)
+
+    return await _run_ytmusic(_library_add_remove_playlist)
+
+
+async def add_remove_playlist_tracks(
+    headers: dict[str, str],
+    prov_playlist_id: str,
+    prov_track_ids: list[Any],
+    add: bool,
+    user: str | None = None,
+) -> str | dict[str, Any]:
+    """Async wrapper around adding/removing tracks to a playlist."""
+
+    def _add_playlist_tracks() -> str | dict[str, Any]:
+        ytm = ytmusicapi.YTMusic(auth=headers, user=user)
+        if add:
+            # duplicates=True: YT Music silently drops repeated video IDs otherwise,
+            # which would desync migrated/added playlists from their source order
+            return ytm.add_playlist_items(
+                playlistId=prov_playlist_id,
+                videoIds=prov_track_ids,
+                duplicates=True,
+            )
+        return ytm.remove_playlist_items(playlistId=prov_playlist_id, videos=prov_track_ids)
+
+    return await _run_ytmusic(_add_playlist_tracks)
+
+
+async def rate_track(
+    headers: dict[str, str], prov_track_id: str, rating: LikeStatus, user: str | None = None
+) -> None:
+    """Async wrapper around the ytmusicapi rate_song function."""
+
+    def _rate_track() -> None:
+        ytm = ytmusicapi.YTMusic(auth=headers, user=user)
+        ytm.rate_song(videoId=prov_track_id, rating=rating)
+
+    await _run_ytmusic(_rate_track)
+
+
+async def get_song_radio_tracks(
+    headers: dict[str, str], prov_item_id: str, limit: int = 25, user: str | None = None
+) -> dict[str, Any]:
+    """Async wrapper around the ytmusicapi radio function."""
+
+    def _get_song_radio_tracks() -> dict[str, Any]:
+        ytm = ytmusicapi.YTMusic(auth=headers, user=user)
+        playlist_id = f"RDAMVM{prov_item_id}"
+        result = ytm.get_watch_playlist(
+            videoId=prov_item_id, playlistId=playlist_id, limit=limit, radio=True
+        )
+        # Replace inconsistensies for easier parsing
+        tracks = result.get("tracks")
+        if isinstance(tracks, list):
+            for track in tracks:
+                if track.get("thumbnail"):
+                    track["thumbnails"] = track["thumbnail"]
+                    del track["thumbnail"]
+                if track.get("length"):
+                    track["duration"] = get_sec(track["length"])
+        return result
+
+    return await _run_ytmusic(_get_song_radio_tracks)
+
+
+async def search(
+    query: str,
+    ytm_filter: YTMSearchFilter | None = None,
+    limit: int = 20,
+) -> list[dict[str, Any]]:
+    """Async wrapper around the ytmusicapi search function."""
+
+    def _search() -> list[dict[str, Any]]:
+        # Always search in English: ytmusicapi (1.12.3) matches the result shelf title,
+        # which YouTube returns translated, against the English filter name, so a filtered
+        # search silently returns nothing in most other languages. Revisit once ytmusicapi
+        # compares against the translated title.
+        # Unauthenticated on purpose: an account search lands in the user's YouTube search history.
+        ytm = ytmusicapi.YTMusic(language="en")
+        results = ytm.search(query=query, filter=ytm_filter, limit=limit)
+        # Sync result properties with uniformal objects
+        for result in results:
+            if result["resultType"] == "artist":
+                if "artists" in result and len(result["artists"]) > 0:
+                    result["id"] = result["artists"][0]["id"]
+                    result["name"] = result["artists"][0]["name"]
+                    del result["artists"]
+                else:
+                    result["id"] = result["browseId"]
+                    result["name"] = result["artist"]
+                    del result["browseId"]
+                    del result["artist"]
+            elif result["resultType"] == "playlist":
+                if "playlistId" in result:
+                    result["id"] = result["playlistId"]
+                    del result["playlistId"]
+                elif "browseId" in result:
+                    result["id"] = result["browseId"]
+                    del result["browseId"]
+        return results[:limit]
+
+    return await _run_ytmusic(_search)
+
+
+def get_playlist_checksum(playlist_obj: dict[str, Any]) -> str:
+    """Try to calculate a checksum so we can detect changes in a playlist."""
+    for key in ("duration_seconds", "trackCount", "count"):
+        if key in playlist_obj:
+            return str(playlist_obj[key])
+    return str(int(time()))
+
+
+def is_brand_account(username: str) -> bool:
+    """Check if the provided username is a brand-account."""
+    return len(username) == 21 and username.isdigit()
+
+
+def get_sec(time_str: str) -> int:
+    """Get seconds from time."""
+    parts = time_str.split(":")
+    if len(parts) == 3:
+        return int(parts[0]) * 3600 + int(parts[1]) * 60 + int(parts[2])
+    if len(parts) == 2:
+        return int(parts[0]) * 60 + int(parts[1])
+    return 0
+
+
+def convert_to_netscape(raw_cookie_str: str, domain: str) -> str:
+    """Convert a raw cookie into Netscape format, so yt-dl can use it."""
+    domain = domain.replace("https://", "")
+    cookie = SimpleCookie()
+    cookie.load(rawdata=raw_cookie_str)
+    netscape_cookie = "# Netscape HTTP Cookie File\n"
+    for morsel in cookie.values():
+        netscape_cookie += f"{domain}\tTRUE\t/\tTRUE\t0\t{morsel.key}\t{morsel.value}\n"
+    return netscape_cookie
+
+
+async def get_home(
+    headers: dict[str, str], language: str = "en", user: str | None = None, limit: int = 3
+) -> list[dict[str, Any]]:
+    """Get the recommendations from the home page."""
+
+    def _get_home() -> list[dict[str, Any]]:
+        ytm = ytmusicapi.YTMusic(auth=headers, language=language, user=user)
+        return ytm.get_home(limit=limit)
+
+    return await _run_ytmusic(_get_home)
+
+
+def determine_recommendation_icon(name: str) -> str:
+    """Determine the icon for a recommendation based on its name."""
+    query = name.lower()
+
+    if "listen again" in query:
+        return YTMRecommendationIcons.LISTEN_AGAIN
+    if "continue" in query:
+        return YTMRecommendationIcons.CONTINUE_WATCHING
+    if "your mix" in query:
+        return YTMRecommendationIcons.YOUR_MIX
+    if "new" in query:
+        return YTMRecommendationIcons.NEW_RELEASES
+    if "recommended" in query:
+        return YTMRecommendationIcons.RECOMMENDED
+    return YTMRecommendationIcons.DEFAULT
+
+
+async def _run_ytmusic[T](func: Callable[[], T]) -> T:
+    """Run a blocking ytmusicapi call in a thread, translating a signed-out session."""
+    try:
+        return await asyncio.to_thread(func)
+    except (KeyError, IndexError) as err:
+        _raise_if_signed_out(err)
+        raise
+
+
+def _raise_if_signed_out(err: Exception) -> None:
+    """Raise LoginFailed if the error carries YouTube's signed-out page."""
+    # An invalid cookie makes YouTube answer with its signed-out page instead of an auth
+    # error, so nav() fails on the unexpected payload and embeds it in the message.
+    if "signInEndpoint" not in str(err):
+        return
+    raise LoginFailed(
+        "Your YouTube Music session is no longer valid. "
+        "Please reconfigure this provider with a fresh cookie."
+    ) from err

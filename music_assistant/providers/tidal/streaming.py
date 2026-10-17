@@ -1,0 +1,227 @@
+"""Streaming operations for Tidal."""
+
+from __future__ import annotations
+
+import base64
+import hashlib
+import json
+from contextlib import suppress
+from typing import TYPE_CHECKING, Any
+
+from aiohttp import web
+from music_assistant_models.enums import ContentType, StreamType
+from music_assistant_models.errors import MediaNotFoundError
+from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.streamdetails import StreamDetails
+
+from .constants import CONF_QUALITY
+
+if TYPE_CHECKING:
+    from .provider import TidalProvider
+
+# Seconds of idle buffer after which a DASH manifest route is cleaned up.
+# Each time ffmpeg fetches the manifest, the cleanup timer resets — so
+# this is only an idle timeout applied AFTER active playback (or seeks)
+# stops. Set to 300s so that seeks and queue transitions always land on
+# a live route, even when the old ffmpeg process has been dead for
+# minutes before the new one starts fetching.
+_DASH_ROUTE_IDLE_BUFFER: int = 300
+
+# manifestMimeType values Tidal's playbackinfopostpaywall endpoint returns.
+_MANIFEST_DASH = "application/dash+xml"
+_MANIFEST_BTS = "application/vnd.tidal.bts"
+
+# ReplayGain 2.0 reference level; Tidal's replay gain values are relative to it.
+_REPLAYGAIN_REFERENCE_LUFS = -18.0
+
+
+def _loudness_from_gain(value: float | None) -> float | None:
+    """Convert a ReplayGain value to absolute loudness in LUFS."""
+    if value is None:
+        return None
+    return _REPLAYGAIN_REFERENCE_LUFS - value
+
+
+class TidalStreamingManager:
+    """Manages Tidal streaming operations."""
+
+    def __init__(self, provider: TidalProvider):
+        """Initialize streaming manager."""
+        self.provider = provider
+        self.api = provider.api
+        self.mass = provider.mass
+
+    async def get_stream_details(self, item_id: str) -> StreamDetails:
+        """Get stream details for a track."""
+        # 1. Try direct lookup
+        try:
+            track = await self.provider.get_track(item_id)
+        except MediaNotFoundError:
+            # 2. Fallback to ISRC-based resolution (also heals the library DB)
+            live_id = await self.provider.resolve_live_track_id(item_id)
+            if not live_id:
+                raise MediaNotFoundError(f"Track {item_id} not found")
+            track = await self.provider.get_track(live_id)
+
+        quality = self.provider.config.get_value(CONF_QUALITY)
+
+        # 3. Get playback info
+        try:
+            stream_data = await self._fetch_playback_info(track.item_id, quality)
+        except MediaNotFoundError:
+            # The track lookup is cached for days, so a track that churned after
+            # being cached passes step 1 and the 404 first surfaces here. Heal
+            # (also rewrites the stored mapping) and retry once with the live id.
+            live_id = await self.provider.resolve_live_track_id(item_id)
+            if not live_id or live_id == track.item_id:
+                raise
+            track = await self.provider.get_track(live_id)
+            stream_data = await self._fetch_playback_info(live_id, quality)
+
+        # 4. Parse stream URL
+        manifest_type = stream_data.get("manifestMimeType", "")
+        if manifest_type == _MANIFEST_DASH and "manifest" in stream_data:
+            # Tidal returns a DASH manifest (MPD) as a base64 data: URI.
+            # ffmpeg re-fetches the MPD during playback to read the
+            # segment timeline, but a data: URI can only be read
+            # once. Decode the manifest and serve it from a real HTTP
+            # endpoint on the stream server so re-fetches succeed.
+            manifest_bytes = base64.b64decode(stream_data["manifest"])
+            manifest_hash = hashlib.md5(manifest_bytes, usedforsecurity=False).hexdigest()
+            route_path = f"/tidal-dash/{manifest_hash}"
+            cleanup_id = f"tidal-dash-cleanup-{manifest_hash}"
+
+            # Use track duration + buffer so the route lives through seeks.
+            # ffmpeg's manifest re-fetches extend the deadline further via
+            # _serve_manifest, but seek kills the old ffmpeg — the new one
+            # may not fetch for many seconds so the idle buffer covers that gap.
+            cleanup_ttl: float = _DASH_ROUTE_IDLE_BUFFER + (
+                track.duration or _DASH_ROUTE_IDLE_BUFFER
+            )
+
+            def _schedule_cleanup() -> None:
+                """Schedule (or reschedule) idle cleanup for this manifest route."""
+                self.mass.call_later(
+                    cleanup_ttl,
+                    self._remove_dash_route,
+                    route_path,
+                    task_id=cleanup_id,
+                )
+
+            async def _serve_manifest(_request: web.Request) -> web.Response:
+                # Extend the idle timeout — ffmpeg is still consuming this route.
+                _schedule_cleanup()
+                return web.Response(
+                    body=manifest_bytes,
+                    content_type=_MANIFEST_DASH,
+                    headers={"Cache-Control": "no-cache"},
+                )
+
+            # Register the ephemeral route. If the same manifest was already
+            # registered (another track with identical content), this raises
+            # RuntimeError — we reuse the existing route.
+            with suppress(RuntimeError):
+                self.mass.streams.register_dynamic_route(route_path, _serve_manifest, method="GET")
+
+            # Schedule initial cleanup (or extend the existing deadline).
+            # This MUST be outside the except block so the timer is always
+            # set, even when reusing a pre-registered route.
+            _schedule_cleanup()
+
+            url = f"{self.mass.streams.base_url}{route_path}"
+            bts_codec = None
+        else:
+            url, bts_codec = self._get_direct_url(stream_data)
+
+        # 5. Determine format
+        audio_quality = stream_data.get("audioQuality")
+        if audio_quality in ("HIRES_LOSSLESS", "HI_RES_LOSSLESS", "LOSSLESS"):
+            content_type = ContentType.FLAC
+        elif codec := (bts_codec or stream_data.get("codec")):
+            content_type = ContentType.try_parse(codec)
+        else:
+            content_type = ContentType.MP4
+
+        resolved_audio_format = AudioFormat(
+            content_type=content_type,
+            sample_rate=stream_data.get("sampleRate", 44100),
+            bit_depth=stream_data.get("bitDepth", 16),
+            channels=2,
+        )
+
+        self.provider.play_reporting.register_stream(
+            item_id=track.item_id,
+            quality=stream_data.get("audioQuality", "LOSSLESS"),
+            asset_presentation=stream_data.get("assetPresentation", "FULL"),
+            audio_mode=stream_data.get("audioMode", "STEREO"),
+        )
+
+        loudness = _loudness_from_gain(stream_data.get("trackReplayGain"))
+        loudness_album = _loudness_from_gain(stream_data.get("albumReplayGain"))
+
+        if loudness is not None:
+            self.mass.create_task(
+                self.mass.streams.audio_analysis.set_track_loudness(
+                    item_id=track.item_id,
+                    provider_instance_id_or_domain=self.provider.instance_id,
+                    loudness=loudness,
+                    loudness_album=loudness_album,
+                )
+            )
+
+        return StreamDetails(
+            item_id=track.item_id,
+            provider=self.provider.instance_id,
+            audio_format=resolved_audio_format,
+            stream_type=StreamType.HTTP,
+            duration=track.duration,
+            path=url,
+            can_seek=True,
+            allow_seek=True,
+            loudness=loudness,
+            loudness_album=loudness_album,
+        )
+
+    async def _fetch_playback_info(self, track_id: str, quality: Any) -> dict[str, Any]:
+        """Fetch the (unofficial) playback info for a track."""
+        stream_data = await self.api.get(
+            f"tracks/{track_id}/playbackinfopostpaywall",
+            params={
+                "playbackmode": "STREAM",
+                "assetpresentation": "FULL",
+                "audioquality": quality,
+                # MA has no surround pipeline, so never ask for the Atmos asset.
+                "immersiveaudio": "false",
+            },
+        )
+        self.provider.logger.debug(
+            "Playback info for track %s: audioQuality=%s, audioMode=%s, manifestMimeType=%s",
+            track_id,
+            stream_data.get("audioQuality"),
+            stream_data.get("audioMode"),
+            stream_data.get("manifestMimeType"),
+        )
+        return stream_data
+
+    def _remove_dash_route(self, route_path: str) -> None:
+        """Remove a DASH manifest route from the stream server."""
+        with suppress(RuntimeError):
+            self.mass.streams.unregister_dynamic_route(route_path, method="GET")
+
+    def _get_direct_url(self, stream_data: dict[str, Any]) -> tuple[str, str | None]:
+        """
+        Return the direct stream URL and codec (if known) from non-DASH playback info.
+
+        :param stream_data: The playbackinfopostpaywall response.
+        """
+        codec: str | None = None
+        if stream_data.get("manifestMimeType") == _MANIFEST_BTS and "manifest" in stream_data:
+            # BTS manifests are base64-encoded JSON holding the plain file URL(s).
+            manifest = json.loads(base64.b64decode(stream_data["manifest"]))
+            urls = manifest.get("urls", [])
+            codec = manifest.get("codecs")
+        else:
+            urls = stream_data.get("urls", [])
+        if not urls:
+            raise MediaNotFoundError("No stream URL found")
+        return urls[0], codec

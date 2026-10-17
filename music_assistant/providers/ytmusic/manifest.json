@@ -1,0 +1,16 @@
+{
+  "type": "music",
+  "domain": "ytmusic",
+  "stage": "beta",
+  "name": "YouTube Music",
+  "description": "Stream songs and podcasts from YouTube Music.",
+  "codeowners": ["@MarvinSchenkel"],
+  "credits": ["[ytmusicapi](https://github.com/sigma67/ytmusicapi)"],
+  "requirements": [
+    "ytmusicapi==1.12.3",
+    "duration-parser==1.0.1",
+    "deno==2.9.6"
+  ],
+  "documentation": "https://music-assistant.io/music-providers/youtube-music/",
+  "multi_instance": true
+}

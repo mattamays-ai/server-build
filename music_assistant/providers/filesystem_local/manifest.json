@@ -1,0 +1,13 @@
+{
+  "type": "music",
+  "domain": "filesystem_local",
+  "stage": "stable",
+  "name": "Local files",
+  "description": "Play music, audiobooks and podcasts from folders on this server, connected drives and network shares.",
+  "codeowners": ["@music-assistant"],
+  "requirements": [],
+  "documentation": "https://music-assistant.io/music-providers/local-files/",
+  "multi_instance": true,
+  "self_service": true,
+  "icon": "harddisk"
+}

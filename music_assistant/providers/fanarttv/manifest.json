@@ -1,0 +1,14 @@
+{
+  "type": "metadata",
+  "domain": "fanarttv",
+  "stage": "stable",
+  "name": "fanart.tv",
+  "description": "Provides high-quality artist and album artwork from Fanart.tv, used throughout the Music Assistant UI.",
+  "codeowners": ["@music-assistant"],
+  "credits": ["[Fanart.tv](https://fanart.tv)"],
+  "requirements": [],
+  "documentation": "",
+  "multi_instance": false,
+  "builtin": true,
+  "icon": "folder-information"
+}

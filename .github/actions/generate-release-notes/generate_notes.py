@@ -1,0 +1,643 @@
+#!/usr/bin/env python3
+"""
+Generate release notes based on PRs between two tags.
+
+Reads configuration from .github/release-notes-config.yml for categorization and formatting.
+"""
+
+import os
+import re
+import sys
+from collections import defaultdict
+from collections.abc import Callable
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+import yaml
+from github import Github, GithubException
+
+# GitHub rejects release bodies longer than 125,000 characters; stay slightly
+# under so the release create/update calls can never fail on size.
+MAX_BODY_CHARS = 124_000
+
+# Extracts the dependency name from bump titles like
+# "⬆️ Update music-assistant-frontend to 2.17.294", "Bump pytest from 9.0.3 to 9.1.1"
+# or "Bump `aiosendspin` to 9.1.1"
+BUMP_TITLE_PATTERN = re.compile(r"^(?:⬆️\s*)?(?:Update|Bump)\s+`?([^\s`]+)`?\s+(?:from|to)\s+\S+")
+
+# Bump PRs whose contents already surface elsewhere in the notes: frontend changes
+# are inlined in their own section and models changes ship with the server PRs
+# that use them.
+INLINED_BUMP_DEPS = {"music-assistant-frontend", "music-assistant-models"}
+
+# Match the PR a commit was merged through against its title: GitHub merge commits
+# ("Merge pull request #123 from ...") and squash commits ("Fix thing (#123)").
+MERGE_COMMIT_PR_PATTERN = re.compile(r"Merge pull request #(\d+)")
+SQUASH_COMMIT_PR_PATTERN = re.compile(r"\(#(\d+)\)\s*$")
+
+
+def load_config() -> dict[str, Any]:
+    """Load the release-notes-config.yml configuration."""
+    config_path = ".github/release-notes-config.yml"
+    if not Path(config_path).exists():
+        print(f"Error: {config_path} not found")  # noqa: T201
+        sys.exit(1)
+
+    with open(config_path) as f:
+        return yaml.safe_load(f)
+
+
+def get_tag_date(repo, tag_name) -> datetime | None:
+    """Get the creation date of a tag (supports both annotated and lightweight tags)."""
+    try:
+        ref = repo.get_git_ref(f"tags/{tag_name}")
+        if ref.object.type == "tag":
+            tag_obj = repo.get_git_tag(ref.object.sha)
+            return tag_obj.tagger.date
+        # Lightweight tag - use the commit date
+        commit = repo.get_commit(ref.object.sha)
+        return commit.commit.committer.date
+    except GithubException as e:
+        print(f"Warning: Could not get date for tag {tag_name}: {e}")  # noqa: T201
+        return None
+
+
+def get_pr_number_from_commit_message(message: str) -> int | None:
+    """Return the PR number a commit was merged through, or None if its title names none."""
+    # Only the title is considered: cherry-pick notes and "fixes #..." trailers in the
+    # body reference PRs that did not ship in this comparison.
+    title = message.split("\n", 1)[0]
+    match = MERGE_COMMIT_PR_PATTERN.search(title) or SQUASH_COMMIT_PR_PATTERN.search(title)
+    return int(match.group(1)) if match else None
+
+
+def get_released_pr_numbers(repo, merge_base_sha, previous_tag) -> set[int]:
+    """Get PR numbers that already shipped on the previous tag's (diverged) branch."""
+    released = set()
+    comparison = repo.compare(merge_base_sha, previous_tag)
+    for commit in comparison.commits:
+        pr_number = get_pr_number_from_commit_message(commit.commit.message)
+        if pr_number is not None:
+            released.add(pr_number)
+    return released
+
+
+def get_prs_between_tags(repo, previous_tag, head_sha) -> list[Any]:
+    """Get all merged PRs between the previous tag and exact source commit."""
+    cutoff_date = None
+    released_pr_numbers = set()
+    if not previous_tag:
+        print("No previous tag specified, will include all PRs from branch history")  # noqa: T201
+        # Get the first commit on the branch
+        commits = list(repo.get_commits(sha=head_sha))
+        # Limit to last 100 commits to avoid going too far back
+        commits = commits[:100]
+    else:
+        print(f"Finding PRs between {previous_tag} and {head_sha}")  # noqa: T201
+        comparison = repo.compare(previous_tag, head_sha)
+        commits = comparison.commits
+        print(f"Found {comparison.total_commits} commits")  # noqa: T201
+        if comparison.behind_by:
+            # The previous tag lives on a diverged branch: a minor release (e.g. 2.9.0)
+            # compares against the latest patch tag (2.8.9) on the old stable branch.
+            # That tag's date lies *after* most of this release's content was merged to
+            # dev, so cut off at the merge base (the old branch point) instead, and
+            # drop PRs that already shipped in the patch releases on the old branch.
+            merge_base = comparison.merge_base_commit
+            cutoff_date = merge_base.commit.committer.date
+            print(  # noqa: T201
+                f"Previous tag {previous_tag} has diverged from {head_sha}, "
+                f"using merge base date {cutoff_date} as cutoff"
+            )
+            released_pr_numbers = get_released_pr_numbers(repo, merge_base.sha, previous_tag)
+            print(  # noqa: T201
+                f"Found {len(released_pr_numbers)} PRs already released "
+                f"in patch releases up to {previous_tag}"
+            )
+        else:
+            cutoff_date = get_tag_date(repo, previous_tag)
+            if cutoff_date:
+                print(f"Previous tag date: {cutoff_date}")  # noqa: T201
+
+    # Extract PR numbers from commit messages
+    pr_numbers = set()
+
+    for commit in commits:
+        pr_number = get_pr_number_from_commit_message(commit.commit.message)
+        if pr_number is None:
+            title = commit.commit.message.split("\n", 1)[0]
+            print(f"Warning: no PR number in commit title: {title}")  # noqa: T201
+            continue
+        pr_numbers.add(pr_number)
+
+    print(f"Found {len(pr_numbers)} unique PRs")  # noqa: T201
+
+    # Fetch the actual PR objects, filtering out PRs merged before the cutoff date
+    # and PRs that already shipped in patch releases on the previous (stable) branch
+    prs = []
+    skipped = 0
+    for pr_num in sorted(pr_numbers):
+        if pr_num in released_pr_numbers:
+            skipped += 1
+            print(  # noqa: T201
+                f"  Skipping PR #{pr_num}: already released in a patch release"
+            )
+            continue
+        try:
+            pr = repo.get_pull(pr_num)
+            if pr.merged:
+                if cutoff_date and pr.merged_at and pr.merged_at <= cutoff_date:
+                    skipped += 1
+                    print(  # noqa: T201
+                        f"  Skipping PR #{pr_num}: merged at {pr.merged_at}, before cutoff {cutoff_date}"
+                    )
+                    continue
+                prs.append(pr)
+        except GithubException as e:
+            print(f"Warning: Could not fetch PR #{pr_num}: {e}")  # noqa: T201
+
+    if skipped:
+        print(f"Filtered out {skipped} PRs already released before/in {previous_tag}")  # noqa: T201
+
+    return prs
+
+
+def is_dependency_bump(pr) -> bool:
+    """Whether the PR is a dependency bump (carries the "dependencies" label)."""
+    return any(label.name == "dependencies" for label in pr.labels)
+
+
+def get_bumped_dependency(title) -> str | None:
+    """Return the dependency name from a bump PR title, or None if not parseable."""
+    match = BUMP_TITLE_PATTERN.match(title)
+    return match.group(1) if match else None
+
+
+def filter_dependency_bumps(prs, drop_all=False) -> list[Any]:
+    """
+    Drop dependency-bump PRs that add no information to the notes.
+
+    Bumps of dependencies whose contents are inlined elsewhere are always
+    dropped and only the latest bump per other dependency is kept. With
+    drop_all, every dependency bump is dropped.
+    """
+    latest: dict[str, Any] = {}
+    for pr in prs:
+        if not is_dependency_bump(pr):
+            continue
+        dependency = get_bumped_dependency(pr.title)
+        if dependency:
+            # PRs are ordered oldest to newest, so the last match wins
+            latest[dependency] = pr
+
+    filtered = []
+    for pr in prs:
+        if is_dependency_bump(pr):
+            dependency = get_bumped_dependency(pr.title)
+            if drop_all or (
+                dependency and (dependency in INLINED_BUMP_DEPS or latest[dependency] is not pr)
+            ):
+                continue
+        filtered.append(pr)
+
+    if len(filtered) != len(prs):
+        print(f"Dropped {len(prs) - len(filtered)} dependency-bump PRs from the notes")  # noqa: T201
+    return filtered
+
+
+def categorize_prs(prs, config) -> tuple[dict[str, list[Any]], list[Any]]:
+    """Categorize PRs based on their labels using the config."""
+    categories = defaultdict(list)
+    uncategorized = []
+
+    # Get category definitions from config
+    category_configs = config.get("categories", [])
+
+    # Get excluded labels
+    exclude_labels = set(config.get("exclude-labels", []))
+    include_labels = config.get("include-labels")
+    if include_labels:
+        include_labels = set(include_labels)
+    exclude_title_prefixes = tuple(config.get("exclude-title-prefixes", []))
+
+    for pr in prs:
+        # Check if PR should be excluded
+        pr_labels = {label.name for label in pr.labels}
+
+        if exclude_labels and pr_labels & exclude_labels:
+            continue
+
+        if exclude_title_prefixes and pr.title.startswith(exclude_title_prefixes):
+            continue
+
+        if include_labels and not (pr_labels & include_labels):
+            continue
+
+        # Try to categorize
+        categorized = False
+        for cat_config in category_configs:
+            cat_title = cat_config.get("title", "Other")
+            cat_labels = cat_config.get("labels", [])
+            if isinstance(cat_labels, str):
+                cat_labels = [cat_labels]
+
+            # Check if PR has any of the category labels
+            if pr_labels & set(cat_labels):
+                categories[cat_title].append(pr)
+                categorized = True
+                break
+
+        if not categorized:
+            uncategorized.append(pr)
+
+    return categories, uncategorized
+
+
+def get_contributors(prs, config) -> list[str]:
+    """Extract unique contributors from PRs."""
+    excluded = set(config.get("exclude-contributors", []))
+    contributors = set()
+
+    for pr in prs:
+        author = pr.user.login
+        if author not in excluded:
+            contributors.add(author)
+
+    return sorted(contributors)
+
+
+def format_change_line(pr, config) -> str:
+    """Format a single PR line using the change-template from config."""
+    template = config.get("change-template", "- $TITLE (by @$AUTHOR in #$NUMBER)")
+
+    # Get title and escape characters if specified
+    title = pr.title
+    escapes = config.get("change-title-escapes", "")
+    if escapes:
+        for char in escapes:
+            if char in title:
+                title = title.replace(char, "\\" + char)
+
+    # Replace template variables
+    result = template.replace("$TITLE", title)
+    result = result.replace("$AUTHOR", pr.user.login)
+    result = result.replace("$NUMBER", str(pr.number))
+    return result.replace("$URL", pr.html_url)
+
+
+def extract_frontend_changes(prs) -> tuple[list[str], set[str]]:
+    """
+    Extract frontend changes from frontend update PRs.
+
+    Returns tuple of (frontend_changes_list, frontend_contributors_set)
+    """
+    frontend_changes = []
+    frontend_contributors = set()
+
+    # Pattern to match frontend update PRs
+    frontend_pr_pattern = re.compile(r"^⬆️ Update music-assistant-frontend to \d")
+
+    for pr in prs:
+        if not frontend_pr_pattern.match(pr.title):
+            continue
+
+        print(f"Processing frontend PR #{pr.number}: {pr.title}")  # noqa: T201
+
+        if not pr.body:
+            continue
+
+        # Extract bullet points from PR body, excluding headers and dependabot lines
+        for body_line in pr.body.split("\n"):
+            stripped_line = body_line.strip()
+            # Check if it's a bullet point
+            if stripped_line.startswith(("- ", "* ", "• ")):
+                # Skip thank you lines and dependency updates
+                if "🙇" in stripped_line:
+                    continue
+                if re.match(r"^[•\-\*]\s*Chore\(deps", stripped_line, re.IGNORECASE):
+                    continue
+                # Skip "No changes" entries
+                if re.match(r"^[•\-\*]\s*No changes\s*$", stripped_line, re.IGNORECASE):
+                    continue
+                # Skip translation-sync noise
+                if re.match(r"^[•\-\*]\s*Lokalise", stripped_line, re.IGNORECASE):
+                    continue
+
+                # Add the change
+                frontend_changes.append(stripped_line)
+
+                # Extract contributors mentioned in this line
+                contributors_in_line = re.findall(r"@([a-zA-Z0-9_-]+)", stripped_line)
+                frontend_contributors.update(contributors_in_line)
+
+                # Limit to 20 changes per PR
+                if len(frontend_changes) >= 20:
+                    break
+
+    return frontend_changes, frontend_contributors
+
+
+def generate_release_notes(  # noqa: PLR0915
+    config,
+    categories,
+    uncategorized,
+    contributors,
+    previous_tag,
+    frontend_changes=None,
+    important_notes=None,
+) -> str:
+    """Generate the formatted release notes."""
+    lines = []
+
+    # Add important notes section first if provided
+    if important_notes and important_notes.strip():
+        lines.append("## ⚠️ Important Notes")
+        lines.append("")
+        # Convert literal \n to actual newlines and preserve existing newlines
+        formatted_notes = important_notes.strip().replace("\\n", "\n")
+        lines.append(formatted_notes)
+        lines.append("")
+        lines.append("---")
+        lines.append("")
+
+    # Add header if previous tag exists
+    if previous_tag:
+        repo_url = (
+            os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+            + "/"
+            + os.environ["GITHUB_REPOSITORY"]
+        )
+        channel_raw = os.environ.get("CHANNEL", "")
+        channel = "RC" if channel_raw == "rc" else channel_raw.title()
+        if channel:
+            lines.append(f"## 📦 {channel} Release")
+            lines.append("")
+        lines.append(f"_Changes since [{previous_tag}]({repo_url}/releases/tag/{previous_tag})_")
+        lines.append("")
+
+    # Add categorized PRs - first pass: categories without "after-other" flag
+    category_configs = config.get("categories", [])
+    deferred_categories = []
+
+    for cat_config in category_configs:
+        # Defer categories marked with after-other
+        if cat_config.get("after-other", False):
+            deferred_categories.append(cat_config)
+            continue
+
+        cat_title = cat_config.get("title", "Other")
+        if cat_title not in categories or not categories[cat_title]:
+            continue
+
+        prs = categories[cat_title]
+        lines.append(f"### {cat_title}")
+        lines.append("")
+
+        # Check if category should be collapsed
+        collapse_after = cat_config.get("collapse-after")
+        if collapse_after and len(prs) > collapse_after:
+            lines.append("<details>")
+            lines.append(f"<summary>{len(prs)} changes</summary>")
+            lines.append("")
+
+        for pr in prs:
+            lines.append(format_change_line(pr, config))
+
+        if collapse_after and len(prs) > collapse_after:
+            lines.append("")
+            lines.append("</details>")
+
+        lines.append("")
+
+    # Add frontend changes if any (before "Other Changes")
+    if frontend_changes and len(frontend_changes) > 0:
+        lines.append("### 🎨 Frontend Changes")
+        lines.append("")
+        lines.extend(frontend_changes)
+        lines.append("")
+
+    # Add uncategorized PRs if any
+    if uncategorized:
+        lines.append("### Other Changes")
+        lines.append("")
+        for pr in uncategorized:
+            lines.append(format_change_line(pr, config))
+        lines.append("")
+
+    # Add deferred categories (after "Other Changes")
+    for cat_config in deferred_categories:
+        cat_title = cat_config.get("title", "Other")
+        if cat_title not in categories or not categories[cat_title]:
+            continue
+
+        prs = categories[cat_title]
+        lines.append(f"### {cat_title}")
+        lines.append("")
+
+        # Check if category should be collapsed
+        collapse_after = cat_config.get("collapse-after")
+        if collapse_after and len(prs) > collapse_after:
+            lines.append("<details>")
+            lines.append(f"<summary>{len(prs)} changes</summary>")
+            lines.append("")
+
+        for pr in prs:
+            lines.append(format_change_line(pr, config))
+
+        if collapse_after and len(prs) > collapse_after:
+            lines.append("")
+            lines.append("</details>")
+
+        lines.append("")
+
+    # Add contributors section using template
+    if contributors:
+        template = config.get("template", "")
+        if "$CONTRIBUTORS" in template or not template:
+            lines.append("## :bow: Thanks to our contributors")
+            lines.append("")
+            lines.append(
+                "Special thanks to the following contributors who helped with this release:"
+            )
+            lines.append("")
+            lines.append(", ".join(f"@{c}" for c in contributors))
+
+    return "\n".join(lines)
+
+
+def shrink_notes_to_limit(
+    render: Callable[[], str],
+    config,
+    categories,
+    uncategorized,
+    previous_tag,
+    version,
+) -> str:
+    """
+    Trim the least important sections until the notes fit the release body limit.
+
+    The render callable regenerates the notes from the section lists, which are
+    trimmed in place from the bottom up.
+    """
+    footer_lines = ["", "---", "", "_Some changes were omitted to fit these notes on the release._"]
+    if previous_tag:
+        repo_url = (
+            os.environ.get("GITHUB_SERVER_URL", "https://github.com")
+            + "/"
+            + os.environ["GITHUB_REPOSITORY"]
+        )
+        footer_lines[-1] = (
+            "_Some changes were omitted to fit these notes on the release. "
+            f"See the [full changelog]({repo_url}/compare/{previous_tag}...{version}) "
+            "for the complete list._"
+        )
+    footer = "\n".join(footer_lines)
+    budget = MAX_BODY_CHARS - len(footer) - 1
+
+    # Drop entries from the bottom up: deferred (maintenance) sections first,
+    # then "Other Changes", then the regular categories in reverse order
+    category_configs = config.get("categories", [])
+    deferred = [c.get("title", "Other") for c in category_configs if c.get("after-other", False)]
+    regular = [c.get("title", "Other") for c in category_configs if not c.get("after-other", False)]
+    drop_lists = (
+        [categories[title] for title in deferred if title in categories]
+        + [uncategorized]
+        + [categories[title] for title in reversed(regular) if title in categories]
+    )
+
+    notes = render()
+    dropped = 0
+    for entries in drop_lists:
+        while entries and len(notes) > budget:
+            # Drop a chunk proportional to the overflow before re-rendering
+            count = min(len(entries), max(1, (len(notes) - budget) // 100))
+            del entries[-count:]
+            dropped += count
+            notes = render()
+        if len(notes) <= budget:
+            break
+
+    print(f"Omitted {dropped} changes to fit the release body limit")  # noqa: T201
+    return notes + "\n" + footer
+
+
+def main() -> None:
+    """Generate release notes for the target version."""
+    # Get environment variables
+    github_token = os.environ.get("GITHUB_TOKEN")
+    version = os.environ.get("VERSION")
+    previous_tag = os.environ.get("PREVIOUS_TAG", "")
+    head_sha = os.environ.get("HEAD_SHA")
+    channel = os.environ.get("CHANNEL")
+    repo_name = os.environ.get("GITHUB_REPOSITORY")
+    important_notes = os.environ.get("IMPORTANT_NOTES", "")
+
+    if not all([github_token, version, head_sha, channel, repo_name]):
+        print("Error: Missing required environment variables")  # noqa: T201
+        sys.exit(1)
+
+    print(f"Generating release notes for {version} ({channel} channel)")  # noqa: T201
+    print(f"Repository: {repo_name}")  # noqa: T201
+    print(f"Source SHA: {head_sha}")  # noqa: T201
+    print(f"Previous tag: {previous_tag or 'None (first release)'}")  # noqa: T201
+
+    # Initialize GitHub API
+    g = Github(github_token)
+    repo = g.get_repo(repo_name)
+
+    # Load configuration
+    config = load_config()
+    print(f"Loaded config with {len(config.get('categories', []))} categories")  # noqa: T201
+
+    # Get PRs between tags
+    prs = get_prs_between_tags(repo, previous_tag, head_sha)
+    print(f"Processing {len(prs)} merged PRs")  # noqa: T201
+
+    if not prs:
+        print("No PRs found in range")  # noqa: T201
+        no_changes = config.get("no-changes-template", "* No changes")
+        notes = no_changes
+        contributors_list = []
+    else:
+        # A stable X.Y.0 release aggregates months of dependency bumps: drop them
+        # all there, elsewhere only the redundant ones
+        drop_all_bumps = channel == "stable" and re.fullmatch(r"\d+\.\d+\.0", version) is not None
+        prs_for_notes = filter_dependency_bumps(prs, drop_all=drop_all_bumps)
+
+        # Categorize PRs
+        categories, uncategorized = categorize_prs(prs_for_notes, config)
+        print(f"Categorized into {len(categories)} categories, {len(uncategorized)} uncategorized")  # noqa: T201
+
+        # Extract frontend changes and contributors
+        frontend_changes_list, frontend_contributors_set = extract_frontend_changes(prs)
+        print(  # noqa: T201
+            f"Found {len(frontend_changes_list)} frontend changes "
+            f"from {len(frontend_contributors_set)} contributors"
+        )
+
+        # Get server contributors
+        contributors_list = get_contributors(prs, config)
+
+        # Merge frontend contributors with server contributors
+        all_contributors = set(contributors_list) | frontend_contributors_set
+        contributors_list = sorted(all_contributors)
+        print(  # noqa: T201
+            f"Total {len(contributors_list)} unique contributors (server + frontend)"
+        )
+
+        # Generate formatted notes
+        def render_notes() -> str:
+            return generate_release_notes(
+                config,
+                categories,
+                uncategorized,
+                contributors_list,
+                previous_tag,
+                frontend_changes_list,
+                important_notes,
+            )
+
+        notes = render_notes()
+        if len(notes) > MAX_BODY_CHARS:
+            notes = shrink_notes_to_limit(
+                render_notes,
+                config,
+                categories,
+                uncategorized,
+                previous_tag,
+                version,
+            )
+
+    write_outputs(notes, contributors_list)
+
+
+def write_outputs(notes, contributors_list) -> None:
+    """
+    Write the generated notes and the GitHub Actions step outputs.
+
+    The notes are handed to the workflow through a file: passing them through
+    a step output means they end up in an env var or command argument, which
+    hits the kernel argument-size limit on big releases.
+    """
+    notes_file = os.environ.get("RELEASE_NOTES_FILE")
+    if notes_file:
+        with open(notes_file, "w") as f:
+            f.write(notes)
+    output_file = os.environ.get("GITHUB_OUTPUT")
+    if output_file:
+        with open(output_file, "a") as f:
+            if notes_file:
+                f.write(f"release-notes-file={notes_file}\n")
+            f.write("contributors<<EOF\n")
+            f.write(",".join(contributors_list))
+            f.write("\nEOF\n")
+    else:
+        print("\n=== Generated Release Notes ===\n")  # noqa: T201
+        print(notes)  # noqa: T201
+        print("\n=== Contributors ===\n")  # noqa: T201
+        print(", ".join(contributors_list))  # noqa: T201
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,746 @@
+"""Soundcloud support for MusicAssistant."""
+
+from __future__ import annotations
+
+import time
+from typing import TYPE_CHECKING, Any, cast
+from urllib.parse import parse_qs, quote, urlparse
+
+from aiohttp import ClientError
+from music_assistant_models.enums import (
+    ContentType,
+    ImageType,
+    MediaType,
+    ProviderFeature,
+    StreamType,
+)
+from music_assistant_models.errors import InvalidDataError, LoginFailed, MediaNotFoundError
+from music_assistant_models.media_items import (
+    Artist,
+    AudioFormat,
+    MediaItemImage,
+    Playlist,
+    ProviderMapping,
+    RecommendationFolder,
+    SearchResults,
+    Track,
+    UniqueList,
+)
+from music_assistant_models.streamdetails import StreamDetails
+from soundcloudpy import SoundcloudAsyncAPI
+
+from music_assistant.constants import CONF_ENTRY_UNOFFICIAL_PROVIDER
+from music_assistant.controllers.cache import use_cache
+from music_assistant.helpers.util import parse_title_and_version
+from music_assistant.models.music_provider import MusicProvider, describe_sync_error
+from music_assistant.models.recommendation_payload import RecommendationPayloadMixin
+
+CONF_CLIENT_ID = "client_id"
+CONF_AUTHORIZATION = "authorization"
+
+SUPPORTED_FEATURES = {
+    ProviderFeature.LIBRARY_ARTISTS,
+    ProviderFeature.LIBRARY_TRACKS,
+    ProviderFeature.LIBRARY_PLAYLISTS,
+    ProviderFeature.BROWSE,
+    ProviderFeature.SEARCH,
+    ProviderFeature.ARTIST_TOPTRACKS,
+    ProviderFeature.SIMILAR_TRACKS,
+    ProviderFeature.RECOMMENDATIONS,
+}
+
+# When searching, the duration is compared with the full duration to check if it's a preview track etc.
+# Sometimes, for non preview tracks, the duration is off by a bit compared to the full duration so any differences below
+# this tolerance are acceptable
+SEARCH_DURATION_COMPARISON_TOLERANCE = 1000
+
+# Soundcloud serves DRM protected (encrypted HLS) audio for part of its catalog, mostly major
+# label releases. Playing those requires a Widevine/FairPlay CDM, which we do not have.
+# Such a track does still advertise plain mp3 transcodings, but requesting one of those returns
+# a 404, so the presence of an encrypted protocol is what tells us the track is unplayable.
+DRM_PROTOCOL_MARKER = "encrypted"
+
+
+class DrmProtectedTrackError(MediaNotFoundError):
+    """Error raised when a Soundcloud track can only be played in Soundcloud's own apps."""
+
+    def __init__(self, item_id: str | int | None) -> None:
+        """Initialize with the id of the track that can not be streamed."""
+        super().__init__(
+            f"Soundcloud track {item_id} is DRM protected, "
+            "which Soundcloud only allows to be played in its own apps"
+        )
+
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncGenerator
+
+    from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
+    from music_assistant_models.media_items import BrowseFolder, ItemMapping, MediaItemType
+    from music_assistant_models.provider import ProviderManifest
+
+    from music_assistant.mass import MusicAssistant
+    from music_assistant.models import ProviderInstanceType
+
+
+async def setup(
+    mass: MusicAssistant, manifest: ProviderManifest, config: ProviderConfig
+) -> ProviderInstanceType:
+    """Initialize provider(instance) with given configuration."""
+    return SoundcloudMusicProvider(mass, manifest, config, SUPPORTED_FEATURES)
+
+
+class SoundcloudMusicProvider(RecommendationPayloadMixin, MusicProvider):
+    """Provider for Soundcloud."""
+
+    # keep the pre-refactor 3h refresh interval for the mixed-selections payload
+    recommendation_payload_ttl = 3600 * 3
+
+    _user_id: str = ""
+    _soundcloud: SoundcloudAsyncAPI = None
+    _me: dict[str, Any]
+
+    async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
+        """Return Config entries to configure this provider."""
+        return (CONF_ENTRY_UNOFFICIAL_PROVIDER,)
+
+    async def handle_async_init(self) -> None:
+        """Set up the Soundcloud provider."""
+        client_id = self.get_setup_value(CONF_CLIENT_ID)
+        auth_token = self.get_setup_value(CONF_AUTHORIZATION)
+        if not client_id or not auth_token:
+            msg = "Invalid login credentials"
+            raise LoginFailed(msg)
+        self._soundcloud = SoundcloudAsyncAPI(auth_token, client_id, self.mass.http_session)
+        await self._soundcloud.login()
+        self._me = await self._soundcloud.get_account_details()
+        # the API returns the id as a number, while it is only ever used to build request urls
+        self._user_id = str(self._me["id"])
+
+    @use_cache(3600 * 48)  # Cache for 48 hours
+    async def search(
+        self, search_query: str, media_types: list[MediaType], limit: int = 10
+    ) -> SearchResults:
+        """
+        Perform search on musicprovider.
+
+        :param search_query: Search query.
+        :param media_types: A list of media_types to include.
+        :param limit: Number of items to return in the search (per type).
+        """
+        result = SearchResults()
+
+        media_types = [
+            x for x in media_types if x in (MediaType.ARTIST, MediaType.TRACK, MediaType.PLAYLIST)
+        ]
+        if not media_types:
+            return result
+
+        searchresult = await self._soundcloud.search(quote(search_query), limit)
+
+        drm_protected = 0
+        for item in searchresult["collection"]:
+            try:
+                media_type = item["kind"]
+                if media_type == "user" and MediaType.ARTIST in media_types:
+                    result.artists = [*result.artists, await self._parse_artist(item)]
+                elif media_type == "track" and MediaType.TRACK in media_types:
+                    duration = item.get("duration", 0)
+                    full_duration = item.get("full_duration", 0)
+                    if abs(duration - full_duration) < SEARCH_DURATION_COMPARISON_TOLERANCE:
+                        # skip preview/snippet tracks (e.g. in case of free accounts)
+                        # where duration is significantly shorter than full_duration
+                        result.tracks = [*result.tracks, await self._parse_track(item)]
+                elif media_type == "playlist" and MediaType.PLAYLIST in media_types:
+                    result.playlists = [*result.playlists, await self._parse_playlist(item)]
+            except DrmProtectedTrackError:
+                drm_protected += 1
+                continue
+            except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+                # a single unusable result must not discard the rest of the search results
+                self.logger.debug(
+                    "Skipping search result %s: %s", _item_id(item), describe_sync_error(error)
+                )
+                continue
+
+        if drm_protected:
+            self.logger.debug(
+                "Skipped %s DRM protected track(s) in Soundcloud search results", drm_protected
+            )
+        return result
+
+    async def get_library_artists(self) -> AsyncGenerator[Artist]:
+        """Retrieve all library artists from Soundcloud."""
+        time_start = time.time()
+
+        following = await self._soundcloud.get_following(self._user_id)
+        self.logger.debug(
+            "Processing Soundcloud library artists took %s seconds",
+            round(time.time() - time_start, 2),
+        )
+        for artist in following["collection"]:
+            try:
+                yield await self._parse_artist(artist)
+            except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+                self._report_skipped_item(MediaType.ARTIST, artist, error)
+                continue
+
+    async def get_library_playlists(self) -> AsyncGenerator[Playlist]:
+        """Retrieve all library playlists from Soundcloud."""
+        time_start = time.time()
+        async for item in self._soundcloud.get_account_playlists():
+            try:
+                raw_playlist = item["playlist"]
+            except KeyError as error:
+                # the entry holds no playlist payload at all, so there is no id to name
+                self.report_skipped_sync_item(MediaType.PLAYLIST, None, error)
+                continue
+
+            try:
+                playlist = await self._get_playlist_object(
+                    prov_playlist_id=raw_playlist["id"],
+                )
+
+                yield await self._parse_playlist(playlist)
+            except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+                self._report_skipped_item(MediaType.PLAYLIST, raw_playlist, error)
+                continue
+
+        self.logger.debug(
+            "Processing Soundcloud library playlists took %s seconds",
+            round(time.time() - time_start, 2),
+        )
+
+    async def get_library_tracks(self) -> AsyncGenerator[Track]:
+        """Retrieve library tracks from Soundcloud."""
+        time_start = time.time()
+        drm_protected = 0
+        async for track in self._soundcloud.get_track_details_liked(self._user_id):
+            try:
+                yield await self._parse_track(track)
+            except DrmProtectedTrackError:
+                # a permanent restriction on the track rather than a failure to read it, so
+                # it is counted and logged once below instead of reported as a sync failure
+                drm_protected += 1
+                continue
+            except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+                # somehow certain track id's don't exist (anymore)
+                self._report_skipped_item(MediaType.TRACK, track, error)
+                continue
+
+        if drm_protected:
+            self.logger.info(
+                "Skipped %s DRM protected track(s) while syncing the library: "
+                "Soundcloud only allows those to be played in its own apps",
+                drm_protected,
+            )
+
+        self.logger.debug(
+            "Processing Soundcloud library tracks took %s seconds",
+            round(time.time() - time_start, 2),
+        )
+
+    async def get_recommendations(self) -> list[RecommendationFolder]:
+        """Get this provider's available recommendation rows, without items."""
+        rows = await self._recommendation_rows_from_payload()
+        rows.append(
+            RecommendationFolder(
+                name="SoundCloud Feed",
+                translation_key="soundcloud_feed",
+                item_id=f"{self.instance_id}_sc_subscribed_feed",
+                provider=self.instance_id,
+                icon="mdi-rss",
+            )
+        )
+        return rows
+
+    async def get_recommendation_items(
+        self, item_id: str
+    ) -> UniqueList[MediaItemType | ItemMapping | BrowseFolder]:
+        """
+        Get the items for a single recommendation row.
+
+        :param item_id: The item_id of the row, as returned by get_recommendations.
+        """
+        if item_id == f"{self.instance_id}_sc_subscribed_feed":
+            return UniqueList(await self._get_subscribed_feed_tracks())
+        return await self._recommendation_items_from_payload(item_id)
+
+    async def _fetch_recommendation_payload(self) -> list[RecommendationFolder]:
+        """Fetch and parse the mixed-selection collections as folders with items."""
+        folders: list[RecommendationFolder] = []
+        recommendations = await self._soundcloud.get_mixed_selection(40)
+        for collection in recommendations.get("collection", []):
+            folder = RecommendationFolder(
+                name=collection["title"],
+                item_id=f"{self.instance_id}_{collection['id']}",
+                provider=self.instance_id,
+                icon="mdi-playlist-music",
+            )
+            for playlist in (collection.get("items") or {}).get("collection", []):
+                # Each items can be a track, playlist, album or artist but seems playlists only
+                if playlist.get("kind") == "system-playlist":
+                    folder.items.append(await self._parse_playlist(playlist))
+                else:
+                    self.logger.debug(
+                        "Unknown item type in collection for SoundCloud: %s", playlist.get("kind")
+                    )
+                    continue
+            folders.append(folder)
+        return folders
+
+    @use_cache(3600 * 3)  # Cache for 3 hours
+    async def _get_subscribed_feed_tracks(self) -> list[Track]:
+        """Fetch and parse the tracks of the subscribed feed."""
+        tracks: list[Track] = []
+        feed = await self._soundcloud.get_subscribe_feed(40)
+        if not feed or "collection" not in feed:
+            return tracks
+        drm_protected = 0
+        for item in feed["collection"]:
+            if item.get("type") == "track" or item.get("type") == "track-repost":
+                try:
+                    tracks.append(await self._parse_track(item.get("track")))
+                except DrmProtectedTrackError:
+                    drm_protected += 1
+                    continue
+                except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+                    # a single unusable track must not empty the feed
+                    self.logger.debug(
+                        "Skipping feed track %s: %s",
+                        _item_id(item.get("track")),
+                        describe_sync_error(error),
+                    )
+                    continue
+            else:
+                self.logger.debug(
+                    "Unknown type in subscribed feed for SoundCloud: %s", item.get("type")
+                )
+                continue
+        if drm_protected:
+            self.logger.debug(
+                "Skipped %s DRM protected track(s) in the Soundcloud subscribed feed",
+                drm_protected,
+            )
+        return tracks
+
+    @use_cache(3600 * 24 * 14)  # Cache for 14 days
+    async def get_artist(self, prov_artist_id: str) -> Artist:
+        """Get full artist details by id."""
+        artist_obj = await self._soundcloud.get_user_details(prov_artist_id)
+        try:
+            if artist_obj:
+                artist = await self._parse_artist(artist_obj)
+        except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+            self.logger.debug("Skipping artist %s: %s", prov_artist_id, describe_sync_error(error))
+        return artist
+
+    @use_cache(3600 * 24 * 14)  # Cache for 14 days
+    async def get_track(self, prov_track_id: str) -> Track:
+        """Get full track details by id."""
+        track_obj = await self._soundcloud.get_track_details(prov_track_id)
+        try:
+            return await self._parse_track(track_obj[0])
+        except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+            self.logger.debug("Skipping track %s: %s", prov_track_id, describe_sync_error(error))
+            msg = f"Soundcloud track {prov_track_id} is not available"
+            raise MediaNotFoundError(msg) from error
+
+    @use_cache(3600 * 24 * 14)  # Cache for 14 days
+    async def get_playlist(self, prov_playlist_id: str) -> Playlist:
+        """Get full playlist details by id."""
+        playlist_obj = await self._get_playlist_object(prov_playlist_id)
+        try:
+            playlist = await self._parse_playlist(playlist_obj)
+        except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+            self.logger.debug(
+                "Skipping playlist %s: %s", prov_playlist_id, describe_sync_error(error)
+            )
+        return playlist
+
+    async def _get_playlist_object(self, prov_playlist_id: str) -> dict[str, Any]:
+        """Get playlist object from Soundcloud API based on playlist ID type."""
+        # Handle playlist id's which are actually numbers
+        prov_playlist_id = str(prov_playlist_id)
+        if prov_playlist_id.startswith("soundcloud:system-playlists"):
+            # Handle system playlists
+            result = await self._soundcloud.get_system_playlist_details(prov_playlist_id)
+            return cast("dict[str, Any]", result)
+        # Handle regular playlists
+        result = await self._soundcloud.get_playlist_details(prov_playlist_id)
+        return cast("dict[str, Any]", result)
+
+    @use_cache(3600 * 3, allow_expired_cache=True)  # Cache for 3 hours
+    async def get_playlist_tracks(self, prov_playlist_id: str, page: int = 0) -> list[Track]:
+        """Get playlist tracks."""
+        result: list[Track] = []
+        if page > 0:
+            # TODO: soundcloud doesn't seem to support paging for playlist tracks ?!
+            return result
+        playlist_obj = await self._get_playlist_object(prov_playlist_id)
+        if "tracks" not in playlist_obj:
+            return result
+        drm_protected = 0
+        for index, item in enumerate(playlist_obj["tracks"], 1):
+            try:
+                # Skip some ugly "tracks" entries, example:
+                # {'id': 123, 'kind': 'track', 'monetization_model': 'NOT_APPLICABLE'}
+                if "title" in item:
+                    if track := await self._parse_track(item, index):
+                        result.append(track)
+                # But also try to get the track details if the track is not in the playlist
+                else:
+                    track_details = await self._soundcloud.get_track_details(item["id"])
+                    if track := await self._parse_track(track_details[0], index):
+                        result.append(track)
+            except DrmProtectedTrackError:
+                drm_protected += 1
+                continue
+            except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+                self.logger.debug(
+                    "Skipping track %s in playlist %s: %s",
+                    _item_id(item),
+                    prov_playlist_id,
+                    describe_sync_error(error),
+                )
+                continue
+        if drm_protected:
+            self.logger.debug(
+                "Skipped %s DRM protected track(s) in Soundcloud playlist %s",
+                drm_protected,
+                prov_playlist_id,
+            )
+        return result
+
+    @use_cache(3600 * 24 * 14, allow_expired_cache=True)  # Cache for 14 days
+    async def get_artist_toptracks(self, prov_artist_id: str) -> list[Track]:
+        """Get a list of (max 100, API doesn't allow a higher limit) tracks for the given artist."""
+        tracks_obj = await self._soundcloud.get_tracks_from_user(prov_artist_id, 100)
+
+        tracks: list[Track] = []
+
+        # Try multiple fallback mechanisms to get tracks collection
+        collection = self._extract_collection(tracks_obj)
+
+        # If still no collection, try getting popular tracks
+        if not collection:
+            try:
+                popular_tracks_obj = await self._soundcloud.get_popular_tracks_user(
+                    prov_artist_id, 100
+                )
+                collection = self._extract_collection(popular_tracks_obj)
+            except ClientError as error:
+                self.logger.debug("Failed to get popular tracks: %s", error)
+
+        # If no collection found, log warning and return empty list
+        if not collection:
+            self.logger.warning(
+                "No tracks found for artist %s (tried collection, items, and popular tracks)",
+                prov_artist_id,
+            )
+            return tracks
+
+        drm_protected = 0
+        for item in collection:
+            song = await self._soundcloud.get_track_details(item["id"])
+            try:
+                track = await self._parse_track(song[0])
+                tracks.append(track)
+            except DrmProtectedTrackError:
+                drm_protected += 1
+                continue
+            except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+                self.logger.debug("Skipping track %s: %s", item["id"], describe_sync_error(error))
+                continue
+        if drm_protected:
+            self.logger.debug(
+                "Skipped %s DRM protected track(s) in the top tracks of Soundcloud artist %s",
+                drm_protected,
+                prov_artist_id,
+            )
+        return tracks
+
+    def _extract_collection(
+        self, api_response: dict[str, Any] | None
+    ) -> list[dict[str, Any]] | None:
+        """Extract collection or items from SoundCloud API response."""
+        if not api_response:
+            return None
+        return api_response.get("collection") or api_response.get("items")
+
+    @use_cache(3600 * 24 * 14, allow_expired_cache=True)  # Cache for 14 days
+    async def get_similar_tracks(self, prov_track_id: str, limit: int = 25) -> list[Track]:
+        """Retrieve a dynamic list of tracks based on the provided item."""
+        tracks_obj = await self._soundcloud.get_recommended(prov_track_id, limit)
+        tracks: list[Track] = []
+
+        # Check if we have a valid response with tracks collection
+        collection = self._extract_collection(tracks_obj)
+
+        if not collection:
+            self.logger.warning("No similar tracks found for track %s", prov_track_id)
+            return tracks
+
+        drm_protected = 0
+        for item in collection:
+            song = await self._soundcloud.get_track_details(item["id"])
+            try:
+                track = await self._parse_track(song[0])
+                tracks.append(track)
+            except DrmProtectedTrackError:
+                drm_protected += 1
+                continue
+            except (KeyError, TypeError, InvalidDataError, IndexError) as error:
+                self.logger.debug("Skipping track %s: %s", item["id"], describe_sync_error(error))
+                continue
+
+        if drm_protected:
+            self.logger.debug(
+                "Skipped %s DRM protected track(s) in tracks similar to Soundcloud track %s",
+                drm_protected,
+                prov_track_id,
+            )
+        return tracks
+
+    async def _get_stream_url(self, track_info: dict[str, Any]) -> str | None:
+        """
+        Get stream URL, preferring progressive (HTTP) over HLS.
+
+        SoundCloud HLS playlists can have limited content windows (~10 min) which
+        cause seeking failures mid-track. Progressive HTTP URLs support full
+        range-based seeking across the entire track duration.
+
+        :param track_info: Raw track object as returned by the Soundcloud API.
+        """
+        track_auth = track_info.get("track_authorization")
+        if not track_auth:
+            return None
+        transcodings = track_info.get("media", {}).get("transcodings", [])
+        # Two passes: prefer progressive mp3, fall back to any mp3 (which may be HLS)
+        for preferred_protocol in ("progressive", None):
+            for transcoding in transcodings:
+                preset = transcoding.get("preset", "")
+                protocol = transcoding.get("format", {}).get("protocol", "")
+                if not preset.startswith("mp3"):
+                    continue
+                if preferred_protocol is not None and protocol != preferred_protocol:
+                    continue
+                stream_url = (
+                    f"{transcoding['url']}?client_id={self._soundcloud.client_id}"
+                    f"&track_authorization={track_auth}"
+                )
+                req = await self._soundcloud.get(stream_url, headers=self._soundcloud.headers)
+                if isinstance(req, dict) and "url" in req:
+                    return str(req["url"])
+        return None
+
+    async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
+        """Return the content details for the given track when it will be streamed."""
+        full_json = await self._soundcloud.get_track_details(item_id)
+        track_info = full_json[0] if full_json and isinstance(full_json, list) else None
+        if track_info and _is_drm_protected(track_info):
+            # this track should never have been imported, but it may predate that check
+            raise DrmProtectedTrackError(item_id)
+        url = await self._get_stream_url(track_info) if track_info else None
+        if not url:
+            msg = f"No stream URL available for Soundcloud track {item_id}"
+            raise MediaNotFoundError(msg)
+        # Parse CDN URL expiry to avoid seeking with an expired URL.
+        # SoundCloud CDN URLs are short-lived; seeking starts a new FFmpeg process
+        # that makes a fresh HTTP request to the stored URL, which may have expired.
+        expiration = 30  # conservative default if expiry cannot be determined
+        if parsed_qs := parse_qs(urlparse(url).query):
+            for param in ("Expires", "expire"):
+                if expire_ts := parsed_qs.get(param, [None])[0]:
+                    expiration = max(30, int(expire_ts) - int(time.time()) - 10)
+                    break
+        return StreamDetails(
+            provider=self.instance_id,
+            item_id=item_id,
+            # let ffmpeg work out the details itself as
+            # soundcloud uses a mix of different content types and streaming methods
+            audio_format=AudioFormat(
+                content_type=ContentType.UNKNOWN,
+            ),
+            stream_type=StreamType.HLS
+            if url.startswith("https://cf-hls-media.sndcdn.com")
+            else StreamType.HTTP,
+            path=url,
+            can_seek=True,
+            allow_seek=True,
+            expiration=expiration,
+        )
+
+    async def _parse_artist(self, artist_obj: dict[str, Any]) -> Artist:
+        """Parse a Soundcloud user response to Artist model object."""
+        artist_id = None
+        permalink = artist_obj["permalink"]
+        if artist_obj.get("id"):
+            artist_id = artist_obj["id"]
+        if not artist_id:
+            msg = "Artist does not have a valid ID"
+            raise InvalidDataError(msg)
+        artist_id = str(artist_id)
+        artist = Artist(
+            item_id=artist_id,
+            name=artist_obj["username"],
+            provider=self.domain,
+            provider_mappings={
+                ProviderMapping(
+                    item_id=str(artist_id),
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                    url=f"https://soundcloud.com/{permalink}",
+                )
+            },
+        )
+        if artist_obj.get("description"):
+            artist.metadata.description = artist_obj["description"]
+        # skip default_avatar placeholder; it has no high-res variant and 404s after transform
+        if (avatar_url := artist_obj.get("avatar_url")) and "default_avatar" not in avatar_url:
+            img_url = self._transform_artwork_url(avatar_url)
+            artist.metadata.images = UniqueList(
+                [
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=img_url,
+                        provider=self.instance_id,
+                        remotely_accessible=True,
+                    )
+                ]
+            )
+        return artist
+
+    async def _parse_playlist(self, playlist_obj: dict[str, Any]) -> Playlist:
+        """Parse a Soundcloud Playlist response to a Playlist object."""
+        playlist_id = str(playlist_obj["id"])
+        # Remove the "Related tracks" prefix from the playlist name
+        playlist_obj["title"] = playlist_obj["title"].removeprefix("Related tracks: ")
+
+        playlist = Playlist(
+            item_id=playlist_id,
+            provider=self.domain,
+            name=playlist_obj["title"],
+            provider_mappings={
+                ProviderMapping(
+                    item_id=playlist_id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                )
+            },
+        )
+        playlist.is_editable = False
+        if playlist_obj.get("description"):
+            playlist.metadata.description = playlist_obj["description"]
+        artwork_url = playlist_obj.get("artwork_url") or playlist_obj.get("calculated_artwork_url")
+        if artwork_url:
+            playlist.metadata.images = UniqueList(
+                [
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=self._transform_artwork_url(artwork_url),
+                        provider=self.instance_id,
+                        remotely_accessible=True,
+                    )
+                ]
+            )
+        if not artwork_url:
+            # fall back to the artwork of the first track that has one
+            for track_obj in playlist_obj.get("tracks", []):
+                if track_obj.get("artwork_url"):
+                    artwork_url = track_obj["artwork_url"]
+                    break
+        if playlist_obj.get("genre"):
+            playlist.metadata.genres = {playlist_obj["genre"]}
+        if playlist_obj.get("tag_list"):
+            playlist.metadata.style = playlist_obj["tag_list"]
+        return playlist
+
+    async def _parse_track(self, track_obj: dict[str, Any], playlist_position: int = 0) -> Track:
+        """Parse a Soundcloud Track response to a Track model object."""
+        if _is_drm_protected(track_obj):
+            raise DrmProtectedTrackError(track_obj.get("id"))
+        name, version = parse_title_and_version(track_obj["title"])
+        track_id = str(track_obj["id"])
+        track = Track(
+            item_id=track_id,
+            provider=self.domain,
+            name=name,
+            version=version,
+            duration=int(track_obj["duration"] / 1000),
+            provider_mappings={
+                ProviderMapping(
+                    item_id=track_id,
+                    provider_domain=self.domain,
+                    provider_instance=self.instance_id,
+                    audio_format=AudioFormat(
+                        content_type=ContentType.MP3,
+                    ),
+                    url=track_obj["permalink_url"],
+                )
+            },
+            position=playlist_position,
+        )
+        user_id = track_obj["user"]["id"]
+        user = await self._soundcloud.get_user_details(user_id)
+        artist = await self._parse_artist(user)
+        if artist and artist.item_id not in {x.item_id for x in track.artists}:
+            track.artists.append(artist)
+
+        if track_obj.get("artwork_url"):
+            track.metadata.images = UniqueList(
+                [
+                    MediaItemImage(
+                        type=ImageType.THUMB,
+                        path=self._transform_artwork_url(track_obj["artwork_url"]),
+                        provider=self.instance_id,
+                        remotely_accessible=True,
+                    )
+                ]
+            )
+
+        if track_obj.get("description"):
+            track.metadata.description = track_obj["description"]
+        if track_obj.get("genre"):
+            track.metadata.genres = {track_obj["genre"]}
+        if track_obj.get("tag_list"):
+            track.metadata.style = track_obj["tag_list"]
+        return track
+
+    def _transform_artwork_url(self, artwork_url: str) -> str:
+        """Patch artwork URL to a high quality thumbnail."""
+        # This is undocumented in their API docs, but was previously
+        return artwork_url.replace("large", "t500x500")
+
+    def _report_skipped_item(
+        self, media_type: MediaType, item_obj: dict[str, Any], err: Exception
+    ) -> None:
+        """
+        Report a library item that was dropped while listing the library.
+
+        :param media_type: Media type of the skipped item.
+        :param item_obj: Raw api object of the skipped item, whose id is its item id.
+        :param err: The error that made the item unusable.
+        """
+        item_id = item_obj.get("id")
+        self.report_skipped_sync_item(media_type, str(item_id) if item_id else None, err)
+
+
+def _item_id(item_obj: Any) -> Any:
+    """Return the id of a raw api object, or None if it does not have a readable one."""
+    # called from the handlers that log an unusable object, so it must never raise itself
+    return item_obj.get("id") if isinstance(item_obj, dict) else None
+
+
+def _is_drm_protected(track_obj: dict[str, Any]) -> bool:
+    """
+    Return if the given Soundcloud track object is DRM protected.
+
+    :param track_obj: Raw track object as returned by the Soundcloud API. A partial object
+        without media details is not considered DRM protected.
+    """
+    transcodings = track_obj.get("media", {}).get("transcodings", [])
+    return any(
+        DRM_PROTOCOL_MARKER in transcoding.get("format", {}).get("protocol", "")
+        for transcoding in transcodings
+    )

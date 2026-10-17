@@ -1,0 +1,132 @@
+"""
+Implementation of a Stream for the Universal Group Player.
+
+Stream handler for Universal Groups, managing audio distribution to group members.
+Essentially, it multicasts an audio source to multiple client streams, allowing individual
+filter_params for each client.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from collections.abc import AsyncGenerator, Awaitable, Callable, Sequence
+from contextlib import suppress
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from music_assistant_models.media_items import AudioFormat
+
+    from music_assistant.helpers.dsp import ComplexFilter
+
+from music_assistant.constants import MASS_LOGGER_NAME
+from music_assistant.controllers.streams.constants import PacingProfile, output_pacing_args
+from music_assistant.helpers.ffmpeg import get_ffmpeg_stream
+from music_assistant.helpers.util import empty_queue
+
+LOGGER = logging.getLogger(f"{MASS_LOGGER_NAME}.providers.ugp_stream")
+
+
+class UGPStream:
+    """
+    Implementation of a Stream for the Universal Group Player.
+
+    Stream handler for Universal Groups, managing audio distribution to group members.
+    Essentially, it multicasts an audio source to multiple client streams, allowing individual
+    filter_params for each client.
+    """
+
+    def __init__(
+        self,
+        audio_source: AsyncGenerator[bytes],
+        audio_format: AudioFormat,
+        base_pcm_format: AudioFormat,
+        queue_id: str | None,
+        session_id: str | None,
+    ) -> None:
+        """Initialize UGP Stream."""
+        self.audio_source = audio_source
+        self.input_format = audio_format
+        self.base_pcm_format = base_pcm_format
+        self.queue_id = queue_id
+        self.session_id = session_id
+        self.subscribers: list[Callable[[bytes], Awaitable[None]]] = []
+        self._task: asyncio.Task[None] | None = None
+        self._done: asyncio.Event = asyncio.Event()
+
+    @property
+    def done(self) -> bool:
+        """Return if this stream is already done."""
+        return self._done.is_set() and self._task is not None and self._task.done()
+
+    async def stop(self) -> None:
+        """Stop/cancel the stream."""
+        if self._done.is_set():
+            return
+        if self._task and not self._task.done():
+            self._task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._task
+        self._done.set()
+
+    async def subscribe_raw(self) -> AsyncGenerator[bytes]:
+        """
+        Subscribe to the raw/unaltered audio stream.
+
+        The returned stream has the format `self.base_pcm_format`.
+        """
+        # start the runner as soon as the (first) client connects
+        if not self._task:
+            self._task = asyncio.create_task(self._runner())
+        queue: asyncio.Queue[bytes] = asyncio.Queue(10)
+        try:
+            self.subscribers.append(queue.put)
+            while True:
+                chunk = await queue.get()
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            self.subscribers.remove(queue.put)
+            empty_queue(queue)
+            del queue
+
+    async def get_stream(
+        self, output_format: AudioFormat, filter_params: Sequence[str | ComplexFilter] | None = None
+    ) -> AsyncGenerator[bytes]:
+        """Subscribe to the client specific audio stream."""
+        # start the runner as soon as the (first) client connects
+        async for chunk in get_ffmpeg_stream(
+            audio_input=self.subscribe_raw(),
+            input_format=self.base_pcm_format,
+            output_format=output_format,
+            filter_params=filter_params,
+        ):
+            yield chunk
+
+    async def _runner(self) -> None:
+        """Run the stream for the given audio source."""
+        await asyncio.sleep(0.25)  # small delay to allow subscribers to connect
+        try:
+            async for chunk in get_ffmpeg_stream(
+                audio_input=self.audio_source,
+                input_format=self.input_format,
+                output_format=self.base_pcm_format,
+                # the flow source carries no pacing of its own, so this is the single point
+                # that keeps the members from running far ahead, at the flow route's pace.
+                # See the usage policy note in the streams constants.
+                extra_input_args=output_pacing_args(PacingProfile.NEAR_REALTIME),
+            ):
+                await asyncio.gather(
+                    *[sub(chunk) for sub in self.subscribers],
+                    return_exceptions=True,
+                )
+        except asyncio.CancelledError:
+            LOGGER.debug("UGP stream runner cancelled")
+            raise
+        except Exception as err:
+            LOGGER.error("UGP stream runner error: %s", err, exc_info=err)
+        finally:
+            # empty chunk when done
+            await asyncio.gather(*[sub(b"") for sub in self.subscribers], return_exceptions=True)
+            self._done.set()

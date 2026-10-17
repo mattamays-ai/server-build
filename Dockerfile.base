@@ -1,0 +1,346 @@
+# syntax=docker/dockerfile:1
+
+# Python version is centralized in .python-version at repo root.
+# Workflows read that file and pass it here via --build-arg PYTHON_VERSION=...
+# The default below is a safety net for manual `docker build` without --build-arg.
+ARG PYTHON_VERSION=3.14
+
+# BASE docker image for music assistant container
+# This image forms the base for the final image and is not meant to be used directly
+# NOTE that the dev add-on is also based on this base image
+
+FROM python:${PYTHON_VERSION}-slim-trixie AS ffmpeg-builder
+
+# Enable non-free and contrib repositories for FDK-AAC and other codecs
+# (trixie uses the deb822 sources format)
+RUN sed -i 's/^Components: .*/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
+
+# Install build dependencies for FFmpeg
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    yasm \
+    nasm \
+    git \
+    wget \
+    ca-certificates \
+    # Audio codec libraries
+    libfdk-aac-dev \
+    libmp3lame-dev \
+    libopus-dev \
+    libvorbis-dev \
+    libsoxr-dev \
+    libspeex-dev \
+    libtwolame-dev \
+    libvo-amrwbenc-dev \
+    libopencore-amrnb-dev \
+    libopencore-amrwb-dev \
+    libshine-dev \
+    # Audio processing and filters
+    librubberband-dev \
+    libbs2b-dev \
+    libsamplerate0-dev \
+    libmysofa-dev \
+    libjack-jackd2-dev \
+    libpulse-dev \
+    # Additional libraries
+    libbluray-dev \
+    libxml2-dev \
+    libssh-dev \
+    liblzma-dev \
+    # SSL/TLS support for HTTPS
+    libssl-dev \
+    && rm -rf /var/lib/apt/lists/*
+
+# Build FFmpeg 9.0.1 from source with comprehensive audio codec support
+# The pinned SHA256 is verified before extraction; bump both when changing the version.
+ARG FFMPEG_VERSION=9.0.1
+ARG FFMPEG_SHA256=cf38e0e28c7e5605942c4a77755349b0145804a397af37eb1fb4c77cb237f635
+RUN set -x \
+    && wget -q "https://ffmpeg.org/releases/ffmpeg-${FFMPEG_VERSION}.tar.xz" -O /tmp/ffmpeg.tar.xz \
+    && echo "${FFMPEG_SHA256}  /tmp/ffmpeg.tar.xz" | sha256sum -c - \
+    && tar -xJf /tmp/ffmpeg.tar.xz -C /tmp \
+    && cd /tmp/ffmpeg-${FFMPEG_VERSION} \
+    && ./configure \
+        --prefix=/usr/local \
+        --enable-gpl \
+        --enable-nonfree \
+        --enable-version3 \
+        # Audio codecs (comprehensive support)
+        --enable-libfdk-aac \
+        --enable-libmp3lame \
+        --enable-libopus \
+        --enable-libvorbis \
+        --enable-libspeex \
+        --enable-libtwolame \
+        --enable-libshine \
+        --enable-libopencore-amrnb \
+        --enable-libopencore-amrwb \
+        --enable-libvo-amrwbenc \
+        # Audio filters and resampling
+        --enable-libsoxr \
+        --enable-librubberband \
+        --enable-libbs2b \
+        --enable-libmysofa \
+        --enable-libjack \
+        --enable-libpulse \
+        # SSL/TLS support for HTTPS
+        --enable-openssl \
+        # Additional libraries for playlist and network support
+        --enable-libxml2 \
+        --enable-libssh \
+        --enable-lzma \
+        # Optimizations
+        --enable-runtime-cpudetect \
+        # Disable unnecessary features for smaller build
+        --disable-doc \
+        --disable-htmlpages \
+        --disable-manpages \
+        --disable-podpages \
+        --disable-txtpages \
+        --disable-debug \
+        --disable-static \
+        --enable-shared \
+    && make -j$(nproc) \
+    && make install \
+    && strip /usr/local/bin/ffmpeg /usr/local/bin/ffprobe \
+    && rm -rf /tmp/ffmpeg*
+
+##################################################################################################
+
+# PyAV wheel builder - builds PyAV against the custom FFmpeg
+FROM python:${PYTHON_VERSION}-slim-trixie AS pyav-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc g++ python3-dev pkg-config && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ffmpeg-builder /usr/local/lib/libav*.so* /usr/local/lib/
+COPY --from=ffmpeg-builder /usr/local/lib/libsw*.so* /usr/local/lib/
+COPY --from=ffmpeg-builder /usr/local/include/ /usr/local/include/
+COPY --from=ffmpeg-builder /usr/local/lib/pkgconfig/ /usr/local/lib/pkgconfig/
+
+RUN ldconfig
+ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig
+
+# Build PyAV wheel against the custom FFmpeg with the in the Sendspin provider manifest pinned version
+COPY music_assistant/providers/sendspin/manifest.json /tmp/sendspin_manifest.json
+RUN PYAV_VERSION=$(python -c "import json; reqs=json.load(open('/tmp/sendspin_manifest.json'))['requirements']; print(next(r.split('==')[1] for r in reqs if r.startswith('av==')))") && \
+    echo "Building PyAV version: ${PYAV_VERSION}" && \
+    pip wheel --no-binary av av==${PYAV_VERSION} -w /wheels/
+
+##################################################################################################
+
+# Build shairport-sync (airplay receiver provider) from source against this image's
+# libraries, using the same configuration as music_assistant/providers/airplay_receiver/bin/build_binaries.sh:
+# tinysvcmdns as embedded mDNS backend (no avahi), stdout/pipe outputs and metadata support.
+FROM python:${PYTHON_VERSION}-slim-trixie AS shairport-builder
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    git \
+    autoconf \
+    automake \
+    libtool \
+    pkg-config \
+    libconfig-dev \
+    libpopt-dev \
+    libssl-dev \
+    libdbus-1-dev \
+    libglib2.0-dev \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Version and its commit SHA are the single source of truth (also read by
+# build_binaries.sh). Tags are mutable, so the fetched tag is verified against the
+# pinned SHA. Bump both when changing the version.
+ARG SHAIRPORT_VERSION=4.3.7
+ARG SHAIRPORT_SHA=0b1c4391ffd398e7b145eb4b98416261380adeea
+RUN set -x \
+    && git init /tmp/shairport-sync \
+    && cd /tmp/shairport-sync \
+    && git remote add origin https://github.com/mikebrady/shairport-sync.git \
+    && git fetch --depth 1 origin refs/tags/${SHAIRPORT_VERSION} \
+    && git checkout FETCH_HEAD \
+    && test "$(git rev-parse HEAD)" = "${SHAIRPORT_SHA}" \
+    && autoreconf -fi \
+    && ./configure \
+        --with-pipe \
+        --with-metadata \
+        --without-avahi \
+        --without-dns-sd \
+        --with-tinysvcmdns \
+        --with-ssl=openssl \
+        --with-stdout \
+        --sysconfdir=/etc \
+    && make -j$(nproc) \
+    && strip shairport-sync \
+    && cp shairport-sync /usr/local/bin/shairport-sync \
+    && rm -rf /tmp/shairport-sync
+
+##################################################################################################
+
+FROM python:${PYTHON_VERSION}-slim-trixie
+
+# Ensure UTF-8 encoding across system
+ENV LANG=C.UTF-8
+
+# Enable non-free and contrib repositories for codec libraries
+# (trixie uses the deb822 sources format)
+RUN sed -i 's/^Components: .*/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources
+
+# Install runtime dependencies
+RUN set -x \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        ca-certificates \
+        libjemalloc2 \
+        tzdata \
+        wget \
+        # cifs utils and libnfs are needed to mount smb and nfs network shares
+        cifs-utils \
+        libnfs14 \
+        nfs-common \
+        # airplay libraries
+        openssl \
+        libssl-dev \
+        libuuid1 \
+        libcurl4 \
+        libsodium23 \
+        libconfuse2 \
+        libevent-dev \
+        libjson-c5 \
+        libgcrypt20 \
+        # glib is needed by the shairport-sync binary (previously pulled in only
+        # indirectly via the pipewire/pulseaudio utils)
+        libglib2.0-0 \
+        # libsndfile needed for librosa audio file support (smartfades)
+        libsndfile1 \
+        # libchromaprint needed for AcoustID fingerprinting (acoustid_lookup)
+        libchromaprint1 \
+        # Audio codec runtime libraries (needed for FFmpeg)
+        libfdk-aac2 \
+        libmp3lame0 \
+        libopus0 \
+        libvorbis0a \
+        libvorbisenc2 \
+        libsoxr0 \
+        libspeex1 \
+        libtwolame0 \
+        libshine3 \
+        libopencore-amrnb0 \
+        libopencore-amrwb0 \
+        libvo-amrwbenc0 \
+        # Audio processing libraries
+        librubberband2 \
+        libbs2b0 \
+        libsamplerate0 \
+        libmysofa1 \
+        libjack-jackd2-0 \
+        libpulse0 \
+        # Additional libraries
+        libbluray2 \
+        libxml2 \
+        libssh-4 \
+        liblzma5 \
+        # Snapcast dependencies
+        libasound2 \
+        # pactl, used by helpers/pulse_capture.py to suspend/resume sinks
+        pulseaudio-utils \
+        # PulseAudio daemon for MA's private audio-capture server (spotify connect soloist)
+        pulseaudio \
+        libvorbisidec1 \
+        libflac14 \
+        libavahi-client3 \
+        libavahi-common3 \
+        # AirPlay receiver dependencies (shairport-sync)
+        libconfig11 \
+        libpopt0 \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm -f \
+        /usr/bin/parecord \
+        /usr/bin/paplay \
+        /usr/bin/parec \
+        /usr/bin/pamon \
+        /usr/bin/pacat \
+        /usr/bin/pasuspender \
+        /usr/bin/pacmd
+
+# Install Snapcast 0.34.0 from GitHub releases (requires at least 0.27)
+# The pinned SHA256s per arch are verified before install; bump them when changing the version.
+ARG SNAPCAST_VERSION=0.34.0
+ARG TARGETARCH
+RUN set -x \
+    && if [ "$TARGETARCH" = "arm64" ]; then \
+        SNAPCAST_ARCH="arm64"; \
+        SNAPSERVER_SHA256="67b7053077b7d2a8a8cd855acb53e2d66a1de48c106205269c1d32a1a46853a0"; \
+        SNAPCLIENT_SHA256="d83466b35102fb07a18df69026f7f1e78add15d07e3d8457c93af291e9b96ac1"; \
+    else \
+        SNAPCAST_ARCH="amd64"; \
+        SNAPSERVER_SHA256="c20ade4373f486b77ec20026c88f08b35a820ab9a6548120a7886bdaa09476fb"; \
+        SNAPCLIENT_SHA256="3992289ab90484494db0032d0e85b49ad59c37f86b5e5af8a6a86307c399812b"; \
+    fi \
+    && wget -q "https://github.com/badaix/snapcast/releases/download/v${SNAPCAST_VERSION}/snapserver_${SNAPCAST_VERSION}-1_${SNAPCAST_ARCH}_trixie.deb" -O /tmp/snapserver.deb \
+    && wget -q "https://github.com/badaix/snapcast/releases/download/v${SNAPCAST_VERSION}/snapclient_${SNAPCAST_VERSION}-1_${SNAPCAST_ARCH}_trixie.deb" -O /tmp/snapclient.deb \
+    && echo "${SNAPSERVER_SHA256}  /tmp/snapserver.deb" | sha256sum -c - \
+    && echo "${SNAPCLIENT_SHA256}  /tmp/snapclient.deb" | sha256sum -c - \
+    # install via apt so any missing dependencies of the debs are resolved as well
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/snapserver.deb /tmp/snapclient.deb \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && rm /tmp/snapserver.deb /tmp/snapclient.deb
+
+# Install go-librespot (used by the Spotify Connect provider) from GitHub releases.
+# The release binaries statically link libvorbis/libogg/libFLAC, so the only dynamic
+# dependency is libasound2 (already installed above for Snapcast).
+# The pinned SHA256 per arch is verified before extraction; bump both when changing the version.
+ARG GO_LIBRESPOT_VERSION=0.9.0
+RUN set -x \
+    && if [ "$TARGETARCH" = "arm64" ]; then \
+        GO_LIBRESPOT_ARCH="arm64"; \
+        GO_LIBRESPOT_SHA256="79b80bb3723b7973165d2d94c428676b8582780aeca7c54694589206ab741e91"; \
+    else \
+        GO_LIBRESPOT_ARCH="x86_64"; \
+        GO_LIBRESPOT_SHA256="87b27ce57cc7871bad6ffac8acba7e2a89c72a7e6c7990b88bec404f449f381e"; \
+    fi \
+    && wget -q "https://github.com/devgianlu/go-librespot/releases/download/v${GO_LIBRESPOT_VERSION}/go-librespot_linux_${GO_LIBRESPOT_ARCH}.tar.gz" -O /tmp/go-librespot.tar.gz \
+    && echo "${GO_LIBRESPOT_SHA256}  /tmp/go-librespot.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/go-librespot.tar.gz -C /usr/local/bin go-librespot \
+    && chmod +x /usr/local/bin/go-librespot \
+    && rm /tmp/go-librespot.tar.gz
+
+# Copy FFmpeg binaries and libraries from builder stage
+COPY --from=ffmpeg-builder /usr/local/bin/ffmpeg /usr/local/bin/
+COPY --from=ffmpeg-builder /usr/local/bin/ffprobe /usr/local/bin/
+COPY --from=ffmpeg-builder /usr/local/lib/libav*.so* /usr/local/lib/
+COPY --from=ffmpeg-builder /usr/local/lib/libsw*.so* /usr/local/lib/
+
+# Copy shairport-sync binary from builder stage (found by the airplay receiver
+# provider via its system PATH lookup)
+COPY --from=shairport-builder /usr/local/bin/shairport-sync /usr/local/bin/
+
+# Copy pre-built PyAV wheel for use by downstream images
+COPY --from=pyav-builder /wheels/ /usr/local/share/pyav-wheels/
+
+# Verify FFmpeg and the custom PyAV wheel with all codec runtime libraries available.
+RUN ldconfig && ffmpeg -version && ffprobe -version \
+    && python -m pip install --no-cache-dir --no-index --no-deps \
+        --target /tmp/pyav-check /usr/local/share/pyav-wheels/av*.whl \
+    && PYTHONPATH=/tmp/pyav-check python -c "import av; print(av.library_versions)" \
+    && rm -rf /tmp/pyav-check
+
+# Copy widevine client files to container
+RUN mkdir -p /usr/local/bin/widevine_cdm
+COPY widevine_cdm/* /usr/local/bin/widevine_cdm/
+
+# we need to set (very permissive) permissions to the workdir
+# and /tmp to allow running the container as non-root
+RUN chmod -R 777 /tmp
+
+LABEL \
+    org.opencontainers.image.title="Music Assistant Base Image" \
+    org.opencontainers.image.description="Base Image for Music Assistant server - not to be used directly" \
+    org.opencontainers.image.source="https://github.com/music-assistant/server" \
+    org.opencontainers.image.authors="The Music Assistant Team" \
+    org.opencontainers.image.licenses="Apache License 2.0"

@@ -1,0 +1,12 @@
+{
+  "type": "music",
+  "domain": "audible",
+  "stage": "stable",
+  "name": "Audible",
+  "description": "Access Audible's extensive audiobook library and podcast catalogue — perfect for spoken-word listening.",
+  "codeowners": ["@ztripez"],
+  "credits": ["[Audible library](https://github.com/mkb79/Audible)"],
+  "requirements": ["audible==0.10.0"],
+  "documentation": "https://www.music-assistant.io/music-providers/audible",
+  "multi_instance": true
+}

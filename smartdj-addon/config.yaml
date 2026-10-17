@@ -1,0 +1,62 @@
+name: Music Assistant Smart DJ
+version: "0.0.21"
+slug: music_assistant_smartdj
+description: Music Assistant built from the mattamays-ai Smart DJ fork. Prebuilt image, fast starts.
+url: https://github.com/mattamays-ai/server
+arch:
+  - amd64
+  - aarch64
+image: ghcr.io/mattamays-ai/server
+homeassistant_api: true
+hassio_api: true
+hassio_role: manager
+discovery:
+  - music_assistant
+auth_api: true
+host_network: true
+ingress: true
+ingress_port: 18094
+audio: true
+map:
+  - media:rw
+  - ssl:ro
+init: false
+tmpfs: true
+backup_exclude:
+  - cache.db
+  - collage_images/*
+  - .cache/*
+options:
+  log_level: info
+  safe_mode: false
+  reset_admin: false
+  spotify_client_id: ""
+  apple_music_token: ""
+  tidal_client_id_v2: ""
+  tidal_client_secret_v2: ""
+  qobuz_app_id: ""
+  qobuz_app_secret: ""
+  deezer_decrypt_key: ""
+  lastfm_api_key: ""
+  lastfm_api_secret: ""
+  theaudiodb_api_key: ""
+  fanarttv_api_key: ""
+  acoustid_api_key: ""
+  rapidapi_key: ""
+schema:
+  log_level: list(debug|info|warning|error)
+  safe_mode: bool
+  reset_admin: bool
+  spotify_client_id: str?
+  apple_music_token: password?
+  tidal_client_id_v2: str?
+  tidal_client_secret_v2: password?
+  qobuz_app_id: str?
+  qobuz_app_secret: password?
+  deezer_decrypt_key: password?
+  lastfm_api_key: password?
+  lastfm_api_secret: password?
+  theaudiodb_api_key: password?
+  fanarttv_api_key: password?
+  acoustid_api_key: password?
+  rapidapi_key: password?

@@ -1,0 +1,439 @@
+"""Tests for music_assistant.providers.snapcast.ma_stream._register_tcp_server_source."""
+
+from __future__ import annotations
+
+import asyncio
+from typing import TYPE_CHECKING
+from unittest.mock import MagicMock
+
+import pytest
+from music_assistant_models.enums import ContentType
+
+from music_assistant.providers.snapcast.constants import (
+    DEFAULT_SNAPCAST_FORMAT,
+    snapcast_sampleformat_query,
+    snapcast_stream_format,
+)
+from music_assistant.providers.snapcast.ma_stream import SnapcastMAStream
+from music_assistant.providers.snapcast.provider import SnapCastProvider
+
+if TYPE_CHECKING:
+    from .conftest import FakeSnapserver
+
+
+def _make_stream(
+    provider: MagicMock, name: str = "Music Assistant - testhash (announcement)"
+) -> SnapcastMAStream:
+    """
+    Build a SnapcastMAStream instance directly.
+
+    Bypasses the constructor's media handling (we only test the snapserver
+    source registration).
+    """
+    media = MagicMock()
+    return SnapcastMAStream(
+        provider=provider,
+        media=media,
+        stream_name=name,
+    )
+
+
+@pytest.mark.parametrize(
+    ("sample_rate", "bit_depth", "expected"),
+    [
+        (48000, 16, "sampleformat=48000:16:2"),
+        (96000, 16, "sampleformat=96000:16:2"),
+        (96000, 24, "sampleformat=96000:24:2&packed_s24le=true"),
+        (192000, 24, "sampleformat=192000:24:2&packed_s24le=true"),
+    ],
+)
+def test_sampleformat_query_enables_packed_s24le_for_24bit(
+    sample_rate: int, bit_depth: int, expected: str
+) -> None:
+    """24-bit TCP sources must request packed_s24le; 16-bit must not."""
+    audio_format = snapcast_stream_format(sample_rate, bit_depth)
+    assert snapcast_sampleformat_query(audio_format) == expected
+
+
+def test_stream_format_maps_bit_depth_to_pcm_content_type() -> None:
+    """Bit depth selects the matching packed PCM content type."""
+    assert snapcast_stream_format(48000, 16).content_type == ContentType.PCM_S16LE
+    assert snapcast_stream_format(96000, 24).content_type == ContentType.PCM_S24LE
+
+
+def test_transport_format_uses_snapserver_codec() -> None:
+    """The reported final format follows the codec configured on Snapserver."""
+    provider = MagicMock()
+    provider._use_builtin_server = True
+    provider._snapcast_server_transport_codec = "opus"
+    provider.stream_audio_format = DEFAULT_SNAPCAST_FORMAT
+    stream = _make_stream(provider)
+
+    output_format = stream._get_transport_format()
+
+    assert output_format.content_type == ContentType.OPUS
+    assert output_format.codec_type == ContentType.OPUS
+    assert output_format.sample_rate == 48000
+    assert output_format.bit_depth == 16
+
+
+def test_transport_format_follows_configured_stream_format() -> None:
+    """Transport format inherits the configured Snapcast PCM sample rate/bit depth."""
+    provider = MagicMock()
+    provider._use_builtin_server = True
+    provider._snapcast_server_transport_codec = "flac"
+    provider.stream_audio_format = snapcast_stream_format(96000, 24)
+    stream = _make_stream(provider)
+
+    output_format = stream._get_transport_format()
+
+    assert output_format.content_type == ContentType.FLAC
+    assert output_format.sample_rate == 96000
+    assert output_format.bit_depth == 24
+
+
+def test_external_transport_format_reads_uri_codec() -> None:
+    """External Snapserver codec is read from the stream URI query."""
+    provider = MagicMock()
+    provider._use_builtin_server = False
+    provider.stream_audio_format = DEFAULT_SNAPCAST_FORMAT
+    stream = _make_stream(provider)
+    stream.snap_stream = MagicMock(
+        _stream={"uri": {"query": {"codec": "flac"}}},
+    )
+
+    output_format = stream._get_transport_format()
+
+    assert output_format.content_type == ContentType.FLAC
+    assert output_format.codec_type == ContentType.FLAC
+
+
+@pytest.mark.asyncio
+async def test_register_uses_configured_sampleformat(
+    fake_provider: MagicMock, fake_snapserver: FakeSnapserver
+) -> None:
+    """stream_add_stream URI must include the configured sampleformat and packed_s24le."""
+    fake_provider.stream_audio_format = snapcast_stream_format(96000, 24)
+    fake_snapserver.queue_success(stream_id="hires-1")
+    stream = _make_stream(fake_provider)
+
+    await stream._register_tcp_server_source()
+
+    assert len(fake_snapserver.add_stream_calls) == 1
+    uri = fake_snapserver.add_stream_calls[0]
+    assert "sampleformat=96000:24:2" in uri
+    assert "packed_s24le=true" in uri
+
+
+def test_output_plan_is_registered_for_all_snapcast_members() -> None:
+    """Every client consuming a shared Snapcast stream gets the same output path."""
+    provider = MagicMock()
+    provider.stream_audio_format = DEFAULT_SNAPCAST_FORMAT
+    stream = _make_stream(provider)
+    stream.media.source_id = "queue-1"
+    stream.media.queue_session_id = "session-1"
+    stream.snap_stream = MagicMock(identifier="stream-1")
+    group = MagicMock(
+        stream="stream-1",
+        clients=["snap-child"],
+    )
+    provider._snapserver.groups = [group]
+    provider._get_ma_id.return_value = "child"
+    output_details = MagicMock(player_ids=["leader"])
+    stream._output_plan = MagicMock(output_details=output_details)
+
+    stream._register_output_plan()
+
+    registered_ids = {
+        call.args[0] for call in provider.mass.streams.audio_processing.update_output.call_args_list
+    }
+    assert registered_ids == {"leader", "child"}
+
+
+@pytest.mark.asyncio
+async def test_happy_path_register_succeeds_first_attempt(
+    fake_provider: MagicMock, fake_snapserver: FakeSnapserver
+) -> None:
+    """Regression: a clean snapserver returns id on first try, MA registers the stream."""
+    fake_snapserver.queue_success(stream_id="ok-1")
+    stream = _make_stream(fake_provider)
+
+    await stream._register_tcp_server_source()
+
+    assert stream.snap_stream is not None
+    assert stream.snap_stream.identifier == "ok-1"
+    assert len(fake_snapserver.add_stream_calls) == 1
+    assert "sampleformat=48000:16:2" in fake_snapserver.add_stream_calls[0]
+    assert "packed_s24le" not in fake_snapserver.add_stream_calls[0]
+
+
+@pytest.mark.asyncio
+async def test_real_port_conflict_retries_with_different_port(
+    fake_provider: MagicMock, fake_snapserver: FakeSnapserver
+) -> None:
+    """Regression: a non-name error (e.g. port already bound) keeps the loop going."""
+    fake_snapserver.queue_other_error("bind: Address already in use")
+    fake_snapserver.queue_success(stream_id="ok-after-retry")
+
+    stream = _make_stream(fake_provider)
+    await stream._register_tcp_server_source()
+
+    assert stream.snap_stream is not None
+    assert stream.snap_stream.identifier == "ok-after-retry"
+    # Two add_stream calls were made — first failed, second succeeded
+    assert len(fake_snapserver.add_stream_calls) == 2
+    # The two URIs must use different ports
+    port_1 = fake_snapserver.add_stream_calls[0].split("0.0.0.0:")[1].split("?")[0]
+    port_2 = fake_snapserver.add_stream_calls[1].split("0.0.0.0:")[1].split("?")[0]
+    assert port_1 != port_2
+
+
+@pytest.mark.asyncio
+async def test_all_attempts_exhausted_raises_with_honest_message(
+    fake_provider: MagicMock, fake_snapserver: FakeSnapserver
+) -> None:
+    """
+    When all 50 retries fail the error must reference 'after retries' or similar.
+
+    Must NOT say 'No free port found' which lies about the cause.
+    """
+    # Queue 51 errors so even after 50 attempts the loop hits the raise
+    for _ in range(51):
+        fake_snapserver.queue_other_error("Some persistent error")
+
+    stream = _make_stream(fake_provider)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        await stream._register_tcp_server_source()
+
+    message = str(exc_info.value)
+    assert "No free port" not in message, (
+        f"Error message still claims port shortage when the real cause may differ: {message}"
+    )
+    assert "attempts" in message.lower() or "register" in message.lower()
+
+
+@pytest.mark.parametrize(
+    ("result", "expected"),
+    [
+        (
+            {
+                "code": -32603,
+                "data": 'Stream with name "x" already exists',
+                "message": "Internal error",
+            },
+            True,
+        ),
+        (
+            {
+                "code": -32603,
+                "data": 'Stream with name "abc" already exists in registry',
+                "message": "Internal error",
+            },
+            True,
+        ),
+        # negative cases — these must NOT match
+        (
+            {"code": -32603, "data": "bind: Address already in use", "message": "Internal error"},
+            False,
+        ),
+        (
+            {
+                "code": -32603,
+                "data": "Some other error already exists somewhere",
+                "message": "Internal error",
+            },
+            False,
+        ),
+        ({}, False),
+        (None, False),
+        ("plain string", False),
+        ({"data": 12345}, False),
+    ],
+)
+def test_is_name_collision_error_matches_only_specific_pattern(
+    result: object, expected: bool
+) -> None:
+    """_is_name_collision_error must NOT false-positive on unrelated errors."""
+    assert SnapcastMAStream._is_name_collision_error(result) is expected
+
+
+@pytest.mark.asyncio
+async def test_name_collision_with_local_stream_cached_adopts_it(
+    fake_provider: MagicMock, fake_snapserver: FakeSnapserver
+) -> None:
+    """
+    When snapserver reports the name as already-registered MA must adopt the orphan.
+
+    The stream must be in the local snapserver cache; MA must adopt it instead of
+    looping until retries exhaust.
+    """
+    target_name = "Music Assistant - 590b15 (announcement)"
+    fake_snapserver.cache_stream_directly("orphan-id", target_name)
+    fake_snapserver.queue_name_collision()
+
+    stream = _make_stream(fake_provider, name=target_name)
+    await stream._register_tcp_server_source()
+
+    assert stream.snap_stream is not None
+    assert stream.snap_stream.identifier == "orphan-id"
+    # Adoption must NOT spend further retries
+    assert len(fake_snapserver.add_stream_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_name_collision_with_incompatible_format_recreates_stream(
+    fake_provider: MagicMock, fake_snapserver: FakeSnapserver
+) -> None:
+    """Orphan streams with a different sample format must be removed and recreated."""
+    target_name = "Music Assistant - hires"
+    fake_provider.stream_audio_format = snapcast_stream_format(96000, 24)
+    fake_snapserver.cache_stream_directly("orphan-id", target_name)
+    fake_snapserver.queue_name_collision()
+    fake_snapserver.queue_success(stream_id="recreated-id")
+
+    stream = _make_stream(fake_provider, name=target_name)
+    await stream._register_tcp_server_source()
+
+    assert stream.snap_stream is not None
+    assert stream.snap_stream.identifier == "recreated-id"
+    assert fake_snapserver.stream_remove_stream.await_count == 1
+    assert "sampleformat=96000:24:2" in fake_snapserver.add_stream_calls[-1]
+    assert "packed_s24le=true" in fake_snapserver.add_stream_calls[-1]
+
+
+@pytest.mark.asyncio
+async def test_orphan_stream_after_ma_restart_gets_adopted_via_resync(
+    fake_provider: MagicMock, fake_snapserver: FakeSnapserver
+) -> None:
+    """
+    Bug B core scenario: MA restarted while a stream was registered.
+
+    The local snapserver cache is empty, but the server still holds the orphan.
+    MA must call status() + synchronize() to re-discover it before adopting.
+    """
+    target_name = "Music Assistant - 590b15 (announcement)"
+    # Stream visible only via status(), NOT in the local cache yet
+    fake_snapserver.stage_orphan_stream("orphan-id", target_name)
+    fake_snapserver.queue_name_collision()
+
+    # Sanity: the local cache is empty before
+    assert fake_snapserver._streams_by_id == {}
+
+    stream = _make_stream(fake_provider, name=target_name)
+    await stream._register_tcp_server_source()
+
+    assert stream.snap_stream is not None
+    assert stream.snap_stream.identifier == "orphan-id"
+    # The status() round-trip must have happened
+    assert fake_snapserver.status.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_second_register_call_is_idempotent_when_stream_already_set(
+    fake_provider: MagicMock, fake_snapserver: FakeSnapserver
+) -> None:
+    """
+    Calling _register_tcp_server_source after self.snap_stream is set is a no-op.
+
+    This is the early-return guard at the top of the method. Real concurrency
+    safety is provided by `_lifecycle_lock` in setup(); that path is exercised
+    by integration tests, not unit tests.
+    """
+    fake_snapserver.queue_success(stream_id="single-stream")
+    fake_snapserver.queue_success(stream_id="should-not-happen")
+
+    stream = _make_stream(fake_provider)
+
+    await asyncio.gather(
+        stream._register_tcp_server_source(),
+        stream._register_tcp_server_source(),
+    )
+
+    assert stream.snap_stream is not None
+    assert stream.snap_stream.identifier == "single-stream"
+    # Only ONE add_stream call was issued
+    assert len(fake_snapserver.add_stream_calls) == 1
+
+
+def test_pick_port_avoids_already_tried() -> None:
+    """Within a single retry loop, _pick_port_avoiding must not return a tried port."""
+    # Build a stream stub that exposes only what _pick_port_avoiding needs
+    stream = SnapcastMAStream.__new__(SnapcastMAStream)
+
+    used: set[int] = set()
+    for _ in range(100):
+        port = stream._pick_port_avoiding(used)
+        assert port is not None, "Helper unexpectedly returned None when ports remain"
+        assert 4953 <= port <= 4953 + 200
+        assert port not in used
+        used.add(port)
+
+
+def _displaced_stream(provider: MagicMock, stream_id: str = "music-1") -> SnapcastMAStream:
+    """Build a registered stream and point every snapserver group somewhere else."""
+    stream = _make_stream(provider, name="Music Assistant - music")
+    stream.snap_stream = MagicMock(identifier=stream_id)
+    provider._snapcast_ma_streams = {stream_id: stream}
+    provider._snapserver.groups = [MagicMock(stream="announcement-1")]
+    return stream
+
+
+def test_displaced_stream_is_scheduled_for_stop(fake_provider: MagicMock) -> None:
+    """A stream no group plays anymore is stopped after the idle delay."""
+    stream = _displaced_stream(fake_provider)
+
+    SnapCastProvider.update_stream_usage(fake_provider)
+
+    fake_provider.mass.loop.call_later.assert_called_once_with(3.0, stream.request_stop_stream)
+
+
+def test_pinned_stream_survives_being_displaced(fake_provider: MagicMock) -> None:
+    """
+    Regression: the music stream must outlive an announcement taking over the group.
+
+    The announcement points the group at its own stream, so the music stream reads as
+    unused. Stopping it there leaves nothing to hand the group back to afterwards.
+    """
+    stream = _displaced_stream(fake_provider)
+    stream.pin("player-1")
+
+    SnapCastProvider.update_stream_usage(fake_provider)
+
+    fake_provider.mass.loop.call_later.assert_not_called()
+
+
+def test_one_member_finishing_does_not_release_another_members_pin(
+    fake_provider: MagicMock,
+) -> None:
+    """
+    Regression: announcements on group members run concurrently and share one stream.
+
+    The member that finishes first must not hand the stream back while the others still
+    have every group displaced from it.
+    """
+    stream = _displaced_stream(fake_provider)
+    stream.pin("player-1")
+    stream.pin("player-2")
+
+    stream.unpin("player-1")
+    SnapCastProvider.update_stream_usage(fake_provider)
+
+    fake_provider.mass.loop.call_later.assert_not_called()
+
+    stream.unpin("player-2")
+    SnapCastProvider.update_stream_usage(fake_provider)
+
+    fake_provider.mass.loop.call_later.assert_called_once_with(3.0, stream.request_stop_stream)
+
+
+def test_releasing_the_pin_schedules_the_stop_again(fake_provider: MagicMock) -> None:
+    """A stream that stays unused after its pin is released is stopped as usual."""
+    stream = _displaced_stream(fake_provider)
+    stream.pin("player-1")
+    SnapCastProvider.update_stream_usage(fake_provider)
+
+    stream.unpin("player-1")
+    SnapCastProvider.update_stream_usage(fake_provider)
+
+    fake_provider.mass.loop.call_later.assert_called_once_with(3.0, stream.request_stop_stream)

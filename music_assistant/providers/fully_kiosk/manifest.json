@@ -1,0 +1,15 @@
+{
+  "type": "player",
+  "domain": "fully_kiosk",
+  "stage": "stable",
+  "name": "Fully Kiosk Browser",
+  "description": "Play audio on Fully Kiosk-enabled displays or Android devices.",
+  "codeowners": ["@music-assistant"],
+  "credits": [
+    "[Fully Kiosk library for Python](https://github.com/cgarwood/python-fullykiosk)"
+  ],
+  "requirements": ["python-fullykiosk==0.0.15"],
+  "documentation": "https://music-assistant.io/player-support/fully-kiosk/",
+  "multi_instance": false,
+  "builtin": false
+}

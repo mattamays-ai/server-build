@@ -1,0 +1,10 @@
+{
+  "type": "player",
+  "domain": "local_audio",
+  "name": "Local Audio Out",
+  "description": "Retired: local audio output has moved to the Local Audio App, run as a Sendspin add-on outside Music Assistant.",
+  "codeowners": ["@iVolt1"],
+  "requirements": [],
+  "documentation": "https://music-assistant.io/player-support/local-audio/",
+  "stage": "deprecated"
+}

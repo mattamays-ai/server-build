@@ -1,0 +1,62 @@
+name: 'Generate Release Notes'
+description: 'Generate complete release notes with PR categorization, frontend changes, and merged contributors'
+inputs:
+  version:
+    description: 'The version being released'
+    required: true
+  previous-tag:
+    description: 'The previous release tag to compare against'
+    required: false
+    default: ''
+  head-sha:
+    description: 'The exact source commit used as the comparison head'
+    required: true
+  repository-path:
+    description: 'Path to the checked-out release source'
+    required: false
+    default: '.'
+  channel:
+    description: 'The release channel (stable, rc, beta, nightly)'
+    required: true
+  github-token:
+    description: 'GitHub token for API access'
+    required: true
+  important-notes:
+    description: 'Important notes to display at the top (breaking changes, critical info, etc.)'
+    required: false
+    default: ''
+outputs:
+  release-notes-file:
+    description: 'Path to a file with the complete generated release notes including frontend changes'
+    value: ${{ steps.generate.outputs.release-notes-file }}
+runs:
+  using: 'composite'
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+      with:
+        python-version-file: '${{ inputs.repository-path }}/.python-version'
+        check-latest: true
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        pip install PyGithub PyYAML
+
+    - name: Generate complete release notes
+      id: generate
+      shell: bash
+      env:
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+        VERSION: ${{ inputs.version }}
+        PREVIOUS_TAG: ${{ inputs.previous-tag }}
+        HEAD_SHA: ${{ inputs.head-sha }}
+        CHANNEL: ${{ inputs.channel }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+        GITHUB_SERVER_URL: ${{ github.server_url }}
+        IMPORTANT_NOTES: ${{ inputs.important-notes }}
+        RELEASE_NOTES_FILE: ${{ runner.temp }}/release-notes.md
+      run: |
+        cd "${{ inputs.repository-path }}"
+        chmod +x ${{ github.action_path }}/generate_notes.py
+        python3 ${{ github.action_path }}/generate_notes.py

@@ -1,0 +1,148 @@
+"""Generate updated constraint and requirements files."""
+
+from __future__ import annotations
+
+import json
+import os
+import re
+import sys
+import tomllib
+from pathlib import Path
+
+PACKAGE_REGEX = re.compile(r"^(?:--.+\s)?([-_\.\w\d]+).*==.+$")
+GIT_REPO_REGEX = re.compile(r"^(git\+https:\/\/[-_\.\w\d\/]+[-@_\.\w\d\/]*)$")
+
+# ruff: noqa: T201
+
+
+def _load_pyproject() -> dict:
+    """Load pyproject.toml once."""
+    with open("pyproject.toml", "rb") as fp:
+        return tomllib.load(fp)
+
+
+def gather_uv_index_config(data: dict) -> tuple[list[str], dict[str, str]]:
+    """
+    Read [tool.uv.index] and [tool.uv.sources] from pyproject.toml.
+
+    :return: Tuple of (extra_index_urls, package_variant_suffixes).
+        extra_index_urls: URLs to emit as --extra-index-url.
+        package_variant_suffixes: Maps package name to variant suffix
+            derived from the index URL path (e.g. "cpu" from ".../whl/cpu").
+    """
+    uv_cfg = data.get("tool", {}).get("uv", {})
+    indices = uv_cfg.get("index", [])
+    sources = uv_cfg.get("sources", {})
+
+    # Build index name → (url, variant) mapping
+    index_map: dict[str, tuple[str, str]] = {}
+    for idx in indices:
+        name = idx.get("name", "")
+        url = idx.get("url", "")
+        if not url:
+            continue
+        # Extract variant from URL path: ".../whl/cpu" → "cpu"
+        variant = url.rstrip("/").rsplit("/", 1)[-1] if "/whl/" in url else ""
+        index_map[name] = (url, variant)
+
+    extra_urls = [url for url, _ in index_map.values()]
+
+    # Map packages to their variant suffix
+    pkg_suffixes: dict[str, str] = {}
+    for pkg, source_cfg in sources.items():
+        idx_name = source_cfg.get("index", "")
+        if idx_name in index_map:
+            _, variant = index_map[idx_name]
+            if variant:
+                pkg_suffixes[pkg.lower().replace("_", "-")] = f"+{variant}"
+
+    return extra_urls, pkg_suffixes
+
+
+def gather_core_requirements(data: dict) -> list[str]:
+    """Gather core requirements out of pyproject.toml."""
+    return data["project"]["dependencies"]
+
+
+def gather_requirements_from_manifests() -> list[str]:
+    """Gather all of the requirements from provider manifests."""
+    dependencies: list[str] = []
+    providers_path = "music_assistant/providers"
+    for dir_str in sorted(os.listdir(providers_path)):  # noqa: PTH208, RUF100
+        dir_path = os.path.join(providers_path, dir_str)
+        if not Path(dir_path).is_dir():
+            continue
+        # get files in subdirectory
+        for file_str in os.listdir(dir_path):  # noqa: PTH208, RUF100
+            file_path = os.path.join(dir_path, file_str)
+            if not Path(file_path).is_file():
+                continue
+            if file_str != "manifest.json":
+                continue
+
+            with open(file_path) as _file:
+                provider_manifest = json.loads(_file.read())
+                if "requirements" in provider_manifest:
+                    dependencies += provider_manifest["requirements"]
+    return dependencies
+
+
+def main() -> int:
+    """Run the script."""
+    if not Path("requirements_all.txt").is_file():
+        print("Run this from MA root dir")
+        return 1
+
+    pyproject = _load_pyproject()
+    extra_urls, pkg_suffixes = gather_uv_index_config(pyproject)
+    core_reqs = gather_core_requirements(pyproject)
+    extra_reqs = gather_requirements_from_manifests()
+
+    # use intermediate dict to detect duplicates
+    # TODO: compare versions and only store most recent
+    final_requirements: dict[str, str] = {}
+    for req_str in core_reqs + extra_reqs:
+        package_name = req_str
+        if match := PACKAGE_REGEX.search(req_str):
+            package_name = match.group(1).lower().replace("_", "-")
+        elif match := GIT_REPO_REGEX.search(req_str):
+            package_name = match.group(1)
+        elif package_name in final_requirements:
+            # duplicate package without version is safe to ignore
+            continue
+        else:
+            print(f"Found requirement without (exact) version specifier: {req_str}")
+            package_name = req_str
+
+        existing = final_requirements.get(package_name)
+        if existing:
+            print(f"WARNING: ignore duplicate package: {package_name} - existing: {existing}")
+            continue
+
+        # For packages pinned to alternate indices (e.g. pytorch-cpu), emit
+        # platform-conditional requirements: +cpu suffix on x86_64 (where PyPI
+        # defaults to CUDA), plain version on aarch64 (already CPU-only).
+        if package_name in pkg_suffixes:
+            suffix = pkg_suffixes[package_name]
+            final_requirements[package_name] = (
+                f"{req_str}{suffix}; sys_platform == 'linux' and platform_machine == 'x86_64'\n"
+                f"{req_str}; sys_platform != 'linux' or platform_machine != 'x86_64'"
+            )
+        else:
+            final_requirements[package_name] = req_str
+
+    content = "# WARNING: this file is autogenerated!\n\n"
+    for url in extra_urls:
+        content += f"--extra-index-url {url}\n"
+    content += "\n"
+    for req_key in sorted(final_requirements):
+        req_str = final_requirements[req_key]
+        content += f"{req_str}\n"
+    # Always use LF line endings for cross-platform compatibility
+    Path("requirements_all.txt").write_text(content, newline="\n")
+
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,63 @@
+name: Smart DJ validation
+
+on:
+  pull_request:
+    branches: ["dev"]
+    paths:
+      - "install-smartdj-ma.sh"
+      - "smartdj-addon/**"
+      - "docker/smartdj.Dockerfile"
+      - "music_assistant/providers/smart_dj/**"
+      - "tests/providers/smart_dj/**"
+      - ".github/workflows/smartdj-image.yml"
+      - ".github/workflows/smartdj-validation.yml"
+  push:
+    branches: ["dev"]
+    paths:
+      - "install-smartdj-ma.sh"
+      - "smartdj-addon/**"
+      - "docker/smartdj.Dockerfile"
+      - "music_assistant/providers/smart_dj/**"
+      - "tests/providers/smart_dj/**"
+      - ".github/workflows/smartdj-image.yml"
+      - ".github/workflows/smartdj-validation.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate Smart DJ installer and app metadata
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Check installer syntax
+        run: sh -n install-smartdj-ma.sh
+
+      - name: Guard Supervisor API endpoints
+        shell: bash
+        run: |
+          set -euo pipefail
+          grep -Fq 'store=$(api GET "/store/addons")' install-smartdj-ma.sh
+          grep -Fq 'api POST "/store/addons/$SLUG/install"' install-smartdj-ma.sh
+          if grep -Eq '"/store/apps' install-smartdj-ma.sh; then
+            echo "::error::Installer contains the invalid /store/apps endpoint."
+            exit 1
+          fi
+
+      - name: Validate app metadata and image architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          ruby -ryaml -e '
+            c = YAML.load_file("smartdj-addon/config.yaml")
+            abort "unexpected app slug" unless c["slug"] == "music_assistant_smartdj"
+            abort "missing app version" unless c["version"].is_a?(String) && !c["version"].empty?
+            abort "missing image" unless c["image"] == "ghcr.io/mattamays-ai/server"
+            abort "amd64 support missing" unless c["arch"].include?("amd64")
+            abort "aarch64 support missing" unless c["arch"].include?("aarch64")
+          '
+          grep -Fq 'platforms: linux/amd64,linux/arm64' .github/workflows/smartdj-image.yml

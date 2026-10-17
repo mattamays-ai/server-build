@@ -1,0 +1,11 @@
+{
+  "type": "music",
+  "domain": "qobuz",
+  "stage": "stable",
+  "name": "Qobuz",
+  "description": "Stream high-resolution music from Qobuz’s catalogue — ideal for audiophiles.",
+  "codeowners": ["@music-assistant"],
+  "requirements": [],
+  "documentation": "https://music-assistant.io/music-providers/qobuz/",
+  "multi_instance": true
+}

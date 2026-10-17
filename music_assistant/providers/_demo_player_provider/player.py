@@ -1,0 +1,398 @@
+"""Demo Player implementation."""
+
+from __future__ import annotations
+
+from typing import TYPE_CHECKING
+
+from music_assistant_models.config_entries import ConfigEntry
+from music_assistant_models.enums import ConfigEntryType, PlaybackState, PlayerFeature
+from music_assistant_models.player import PlayerOptionValueType, PlayerSource
+
+from music_assistant.models.player import Player, PlayerMedia
+
+if TYPE_CHECKING:
+    from .provider import DemoPlayerprovider
+
+
+class DemoPlayer(Player):
+    """DemoPlayer in Music Assistant."""
+
+    def __init__(self, provider: DemoPlayerprovider, player_id: str) -> None:
+        """Initialize the Player."""
+        super().__init__(provider, player_id)
+        # init some static variables
+        self._attr_name = f"Demo Player {player_id}"
+        self._attr_supported_features = {
+            PlayerFeature.PLAY_MEDIA,
+            PlayerFeature.POWER,
+            PlayerFeature.VOLUME_SET,
+            PlayerFeature.VOLUME_MUTE,
+            PlayerFeature.PLAY_ANNOUNCEMENT,
+            PlayerFeature.SET_MEMBERS,
+        }
+        # demo players can be (sync) grouped with other players of this provider
+        self._attr_can_group_with = {provider.instance_id}
+        self._set_attributes()
+
+    async def on_config_updated(self) -> None:
+        """Handle logic when the PlayerConfig is first loaded or updated."""
+        # OPTIONAL
+        # This method is optional and should be implemented if you need to handle
+        # any initialization logic after the config was initially loaded or updated.
+        # This is called after the player is registered and self.config was loaded.
+        # And also when the config was updated.
+        # You don't need to call update_state() here.
+
+    @property
+    def needs_poll(self) -> bool:
+        """Return if the player needs to be polled for state updates."""
+        # MANDATORY
+        # this should return True if the player needs to be polled for state updates,
+        # If you player does not need to be polled, you can return False.
+        return True
+
+    @property
+    def poll_interval(self) -> int:
+        """Return the interval in seconds to poll the player for state updates."""
+        # OPTIONAL
+        # used in conjunction with the needs_poll property.
+        # this should return the interval in seconds to poll the player for state updates.
+        return 5 if self._attr_playback_state == PlaybackState.PLAYING else 30
+
+    @property
+    def source_list(self) -> list[PlayerSource]:
+        """Return list of available (native) sources for this player."""
+        # OPTIONAL - required only if you specified PlayerFeature.SELECT_SOURCE
+        # this is an optional property that you can implement if your
+        # player supports (external) source control (aux, HDMI, etc.).
+        # If your player does not support sources, you can leave this out completely.
+        return [
+            PlayerSource(
+                id="line_in",
+                name="Line-In",
+                passive=False,
+                can_play_pause=False,
+                can_next_previous=False,
+                can_seek=False,
+            ),
+            PlayerSource(
+                id="spotify_connect",
+                name="Spotify",
+                # by specifying passive=True, we indicate that this source
+                # is not actively selectable by the user from the UI.
+                passive=True,
+                can_play_pause=True,
+                can_next_previous=True,
+                can_seek=True,
+            ),
+        ]
+
+    async def get_config_entries(self) -> list[ConfigEntry]:
+        """Return all (provider/player specific) Config Entries for the player."""
+        # OPTIONAL
+        # this method is optional and should be implemented if you need player specific
+        # configuration entries. If you do not need player specific configuration entries,
+        # you can leave this method out completely.
+        # note that the config controller will always add a set of default config entries
+        # if you want, you can override those by specifying the same key as a default entry.
+        return [
+            # example of a player specific config entry
+            # you can also override a default entry by specifying the same key
+            # as a default entry, but with a different type or default value.
+            ConfigEntry(
+                key="demo_player_setting",
+                type=ConfigEntryType.STRING,
+                label="Demo Player Setting",
+                required=False,
+                default_value="default_value",
+                description="This is a demo player setting.",
+            ),
+        ]
+
+    async def power(self, powered: bool) -> None:
+        """Handle POWER command on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.POWER
+        # this method should send a power on/off command to the given player.
+        logger = self.provider.logger.getChild(self.player_id)
+        if powered:
+            # In this demo implementation we just set the power state to ON
+            # and optimistically update the state.
+            # In a real implementation you would read the actual value from the player
+            # either from a callback or by polling the player.
+            logger.info("Received POWER ON command on player %s", self.display_name)
+            self._attr_powered = True
+        else:
+            # In this demo implementation we just set the power state to OFF
+            # and optimistically update the state.
+            # In a real implementation you would read the actual value from the player
+            # either from a callback or by polling the player.
+            logger.info("Received POWER OFF command on player %s", self.display_name)
+            self._attr_powered = False
+        # update the player state in the player manager
+        self.update_state()
+
+    async def volume_set(self, volume_level: int) -> None:
+        """Handle VOLUME_SET command on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.VOLUME_SET
+        # this method should send a volume set command to the given player.
+
+        # In this demo implementation we just set the volume level
+        # and optimistically update the state.
+        # In a real implementation you would send a command to the actual player and
+        # get the actual value from the player either from a callback or by polling the player.
+        logger = self.provider.logger.getChild(self.player_id)
+        logger.info(
+            "Received VOLUME_SET command on player %s with level %s",
+            self.display_name,
+            volume_level,
+        )
+        self._attr_volume_level = volume_level  # volume level is between 0 and 100
+        # update the player state in the player manager
+        self.update_state()
+
+    async def volume_mute(self, muted: bool) -> None:
+        """Handle VOLUME MUTE command on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.VOLUME_MUTE
+        # this method should send a volume mute command to the given player.
+        logger = self.provider.logger.getChild(self.player_id)
+        logger.info(
+            "Received VOLUME_MUTE command on player %s with muted %s", self.display_name, muted
+        )
+        self._attr_volume_muted = muted
+        self.update_state()
+
+    async def play(self) -> None:
+        """Play command."""
+        # MANDATORY
+        # this method is mandatory and should be implemented.
+        # this method should send a play/resume command to the given player.
+        # normally this is the point where you would resume playback
+        # on your actual player device.
+
+        # In this demo implementation we just set the playback state to PLAYING
+        # and optimistically set the playback state to PLAYING.
+        # In a real implementation you actually send a command to the player
+        # wait for the player to report a new state before updating the playback state.
+        logger = self.provider.logger.getChild(self.player_id)
+        logger.info("Received PLAY command on player %s", self.display_name)
+        self._attr_playback_state = PlaybackState.PLAYING
+        self.update_state()
+
+    async def stop(self) -> None:
+        """Stop command."""
+        # MANDATORY
+        # this method is mandatory and should be implemented.
+        # this method should send a stop command to the given player.
+        # normally this is the point where you would stop playback
+        # on your actual player device.
+
+        # In this demo implementation we just set the playback state to IDLE
+        # and optimistically set the playback state to IDLE.
+        # In a real implementation you actually send a command to the player
+        # wait for the player to report a new state before updating the playback state.
+        logger = self.provider.logger.getChild(self.player_id)
+        logger.info("Received STOP command on player %s", self.display_name)
+        self._attr_playback_state = PlaybackState.IDLE
+        self._attr_active_source = None
+        self._attr_current_media = None
+        self.update_state()
+
+    async def pause(self) -> None:
+        """Pause command."""
+        # OPTIONAL - required only if you specified PlayerFeature.PAUSE
+        # this method should send a pause command to the given player.
+
+        # In this demo implementation we just set the playback state to PAUSED
+        # and optimistically set the playback state to PAUSED.
+        # In a real implementation you actually send a command to the player
+        # wait for the player to report a new state before updating the playback state.
+        logger = self.provider.logger.getChild(self.player_id)
+        logger.info("Received PAUSE command on player %s", self.display_name)
+        self._attr_playback_state = PlaybackState.PAUSED
+        self.update_state()
+
+    async def next_track(self) -> None:
+        """Next command."""
+        # OPTIONAL - required only if you specified PlayerFeature.NEXT_PREVIOUS
+        # this method should send a next track command to the given player.
+        # Note that this is only needed/used if the player is playing a 3rd party
+        # stream (e.g. Spotify, YouTube, etc.) and the player supports skipping to the next track.
+        # When the player is playing MA content, this is already handled in the Queue controller.
+
+    async def previous_track(self) -> None:
+        """Previous command."""
+        # OPTIONAL - required only if you specified PlayerFeature.NEXT_PREVIOUS
+        # this method should send a previous track command to the given player.
+        # Note that this is only needed/used if the player is playing a 3rd party
+        # stream (e.g. Spotify, YouTube, etc.) and the player supports skipping to the next track.
+        # When the player is playing MA content, this is already handled in the Queue controller.
+
+    async def seek(self, position: int) -> None:
+        """SEEK command on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.SEEK
+        # this method should send a seek command to the given player.
+        # the position is the position in seconds to seek to in the current playing item.
+
+    async def play_media(self, media: PlayerMedia) -> None:
+        """Play media command."""
+        # MANDATORY
+        # This method is mandatory and should be implemented.
+        # This method should handle the play_media command for the given player.
+        # It will be called when media needs to be played on the player.
+        # The media object contains all the details needed to play the item.
+
+        # In 99% of the cases this will be called by the Queue controller to play
+        # a single item from the queue on the player and the uri within the media
+        # object will then contain the URL to play that single queue item.
+
+        # If your player provider does not support enqueuing of items,
+        # the queue controller will simply call this play_media method for
+        # each item in the queue to play them one by one.
+
+        # In order to support true gapless and/or enqueuing, we offer the option of
+        # 'flow_mode' playback. In that case the queue controller will stitch together
+        # all songs in the playbook queue into a single stream and send that to the player.
+        # In that case the URI (and metadata) received here is that of the 'flow mode' stream.
+
+        # Examples of player providers that use flow mode for playback by default are AirPlay,
+        # SnapCast and Fully Kiosk.
+
+        # Examples of player providers that optionally use 'flow mode' are Google Cast and
+        # Home Assistant. They provide a config entry to enable flow mode playback.
+
+        # Examples of player providers that natively support enqueuing of items are Sonos,
+        # Slimproto and Google Cast.
+
+        # In this demo implementation we just optimistically set the state.
+        # In a real implementation you actually send a command to the player
+        # wait for the player to report a new state before updating the playback state.
+        url = await self.provider.mass.streams.resolve_stream_url(self.player_id, media)
+        logger = self.provider.logger.getChild(self.player_id)
+        logger.info("Received PLAY_MEDIA command on player %s with url %s", self.display_name, url)
+        self._attr_current_media = media
+        self._attr_playback_state = PlaybackState.PLAYING
+        self.update_state()
+
+    async def enqueue_next_media(self, media: PlayerMedia) -> None:
+        """Handle enqueuing of the next (queue) item on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.ENQUEUE
+        # This method is optional and should be implemented if you want to support
+        # enqueuing of the next item on the player.
+        # This will be called when the player reports it started buffering a queue item
+        # and when the queue items updated.
+        # A PlayerProvider implementation is in itself responsible for handling this
+        # so that the queue items keep playing until its empty or the player stopped.
+
+    async def play_announcement(
+        self, announcement: PlayerMedia, volume_level: int | None = None
+    ) -> None:
+        """Handle (native) playback of an announcement on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.PLAY_ANNOUNCEMENT
+        # This method is optional and should be implemented if the player supports
+        # NATIVE playback of announcements (with ducking etc.).
+        # The announcement object contains all the details needed to play the announcement.
+        # The volume_level is optional and can be used to set the volume level for the announcement.
+        # If you do not use the announcement playerfeature, the default behavior is to play the
+        # announcement as a regular media item using the play_media method and the MA player manager
+        # will take care of setting the volume level for the announcement and resuming etc.
+        # Override the announcement_features property to declare how this player behaves during
+        # an announcement (see AnnouncementFeature): add COORDINATES_START if it lines up its start
+        # with the other members of a group announcement, APPLIES_VOLUME if it mixes the clip and
+        # sets the level itself, and drop SUPPORTS_VOLUME if its native route ignores the level
+        # (the announcement then uses the builtin path once a level is requested).
+
+    async def select_source(self, source: str) -> None:
+        """Handle SELECT SOURCE command on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.SELECT_SOURCE
+        # This method is optional and should be implemented if the player supports
+        # selecting a source (e.g. HDMI, AUX, etc.) on the player.
+        # The source is the source ID to select on the player.
+        # available sources are specified in the Player.source_list property
+
+    async def select_sound_mode(self, sound_mode: str) -> None:
+        """Handle SELECT SOUND MODE command on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.SELECT_SOUND_MODE.
+        # This method is optional and should be implemented if the player supports
+        # selecting a native sound mode (e.g. stereo, 5.1, classic...).
+        # The sound_mode is the sound mode's id, and available sound modes
+        # are specified in the Player.sound_mode_list property.
+
+    async def set_members(
+        self,
+        player_ids_to_add: list[str] | None = None,
+        player_ids_to_remove: list[str] | None = None,
+    ) -> None:
+        """Handle SET_MEMBERS command on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.SET_MEMBERS
+        # This method is optional and should be implemented if the player supports
+        # syncing/grouping with other players.
+        # This demo keeps a simple in-memory member list: the leader tracks its
+        # group_members and each member's synced_to is then derived automatically by
+        # the base Player from the leader's list. A real provider would also issue the
+        # native sync command to the device here.
+        members = dict.fromkeys(self._attr_group_members)
+        for member_id in player_ids_to_add or []:
+            members[member_id] = None
+        for member_id in player_ids_to_remove or []:
+            members.pop(member_id, None)
+        other_member_ids = [pid for pid in members if pid != self.player_id]
+        # the leader is always the first member while the group is non-empty
+        self._attr_group_members = [self.player_id, *other_member_ids] if other_member_ids else []
+        self.update_state()
+        # refresh affected members so their derived synced_to / can_group_with recompute
+        for member_id in [*(player_ids_to_add or []), *(player_ids_to_remove or [])]:
+            if (member := self.mass.players.get_player(member_id)) is not None:
+                member.update_state()
+
+    async def set_option(self, option_key: str, option_value: PlayerOptionValueType) -> None:
+        """Handle SET_OPTION command on the player."""
+        # OPTIONAL - required only if you specified PlayerFeature.OPTIONS.
+        # PlayerOptions are native settings of the player adjustable on the fly,
+        # e.g. a treble value, toggable settings etc. In the ui they are accessible
+        # on the player menu, or via
+        # player settings -> players -> <select player> -> player options.
+        #
+        # The options are mapped to respective Home Assistant entities, if the integration
+        # is used. The mapping for non read-only option is:
+        # PlayerOptionType.BOOLEAN (w and w/o options) -> SwitchEntity
+        # PlayerOptionType.FLOAT or PlayerOptionType.INTEGER (w/o options) -> NumberEntity
+        # PlayerOptionType.STRING (w/o options) -> TextEntity
+        # PlayerOptionType.FLOAT/ INTEGER/ STRING with options -> SelectEntity.
+        # Read-only options will be mapped to SensorEntities once a provider using them exists.
+        #
+        # The translation key of the respective option must be present in the HA integration,
+        # otherwise, the option is ignored. Currently available keys are listed in the following
+        # dictionaries right at the top of the respective entity type:
+        #
+        # PLAYER_OPTIONS_SWITCH in
+        #   https://github.com/home-assistant/core/blob/dev/homeassistant/components/music_assistant/switch.py
+        # PLAYER_OPTIONS_SELECT in
+        #   https://github.com/home-assistant/core/blob/dev/homeassistant/components/music_assistant/select.py
+        # PLAYER_OPTIONS_NUMBER in
+        #   https://github.com/home-assistant/core/blob/dev/homeassistant/components/music_assistant/number.py
+        # PLAYER_OPTIONS_TEXT in
+        #   https://github.com/home-assistant/core/blob/dev/homeassistant/components/music_assistant/text.py
+        #
+        # Before creating a PR to HA core to support new translation keys, complete the review process in MA.
+        # We are also happy to create the HA PR for you after the review process.
+        # The MusicCast provider can serve as an example for player options.
+
+    async def poll(self) -> None:
+        """Poll player for state updates."""
+        # OPTIONAL - This is called by the Player Manager if the 'needs_poll' property is True.
+        self._set_attributes()
+        self.update_state()
+
+    async def on_unload(self) -> None:
+        """Handle logic when the player is unloaded from the Player controller."""
+        # OPTIONAL
+        # this method is optional and should be implemented if you need to handle
+        # any logic when the player is unloaded from the Player controller.
+        # This is called when the player is removed from the Player controller.
+        self.logger.info("Player %s unloaded", self.name)
+
+    def _set_attributes(self) -> None:
+        """Update/set (dynamic) properties."""
+        self._attr_powered = True
+        self._attr_volume_muted = False
+        self._attr_volume_level = 50

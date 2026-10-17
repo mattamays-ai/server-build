@@ -1,0 +1,14 @@
+{
+  "type": "metadata",
+  "domain": "lrclib",
+  "stage": "stable",
+  "name": "LRCLIB",
+  "description": "Primary lyrics provider, delivering synced and unsynced lyrics from the LrcLib database.",
+  "codeowners": ["@music-assistant"],
+  "requirements": [],
+  "documentation": "",
+  "multi_instance": false,
+  "builtin": true,
+  "allow_disable": true,
+  "icon": "mdi-folder-information"
+}
