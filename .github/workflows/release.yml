@@ -94,7 +94,7 @@ jobs:
           fi
 
       - name: Check out release workflow
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-workflow
@@ -108,7 +108,7 @@ jobs:
           --github-output "$GITHUB_OUTPUT"
 
       - name: Check out source branch
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ steps.branch.outputs.branch }}
           fetch-depth: 0
@@ -365,14 +365,14 @@ jobs:
       sdist_sha256: ${{ steps.assets.outputs.sdist_sha256 }}
     steps:
       - name: Check out release workflow
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-workflow
           persist-credentials: false
 
       - name: Check out release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           path: source
@@ -539,14 +539,14 @@ jobs:
       sdist_sha256: ${{ steps.assets.outputs.sdist_sha256 }}
     steps:
       - name: Check out release workflow
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-workflow
           persist-credentials: false
 
       - name: Check out release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           fetch-depth: 0
@@ -831,14 +831,14 @@ jobs:
       digest: ${{ steps.verify.outputs.digest }}
     steps:
       - name: Check out release workflow
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-workflow
           persist-credentials: false
 
       - name: Check out release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           path: source
@@ -993,14 +993,14 @@ jobs:
       wheel_sha256: ${{ steps.verify_assets.outputs.wheel_sha256 }}
     steps:
       - name: Check out release workflow
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-workflow
           persist-credentials: false
 
       - name: Check out release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           fetch-depth: 0
@@ -1243,7 +1243,7 @@ jobs:
       packages: write
     steps:
       - name: Check out release workflow
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-workflow
@@ -1383,7 +1383,7 @@ jobs:
       contents: read
     steps:
       - name: Check out release workflow
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-workflow
@@ -1430,7 +1430,7 @@ jobs:
           echo "default_branch=$default_branch" >> "$GITHUB_OUTPUT"
 
       - name: Check out add-on repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: music-assistant/home-assistant-addon
           ref: ${{ steps.addon_repository.outputs.default_branch }}
@@ -1534,14 +1534,14 @@ jobs:
       contents: read
     steps:
       - name: Check out release workflow
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.workflow_sha }}
           path: .release-workflow
           persist-credentials: false
 
       - name: Check out exact release source
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ needs.resolve.outputs.source_sha }}
           path: source
