@@ -360,6 +360,7 @@ async def test_refresh_item_preserves_in_library_state() -> None:
     # use TRACK media_type for the returned library_item to skip album-tracks branch
     returned_item = Mock()
     returned_item.media_type = MediaType.TRACK
+    returned_item.provider_mappings = set()
 
     ctrl_mock = AsyncMock()
     ctrl_mock.get_provider_item = AsyncMock(return_value=fresh_item)
@@ -369,6 +370,7 @@ async def test_refresh_item_preserves_in_library_state() -> None:
     mass = Mock()
     mass.get_provider.return_value = Mock()
     mass.metadata = AsyncMock()
+    mass.cache.delete = AsyncMock()
 
     music_ctrl = MusicController.__new__(MusicController)
     music_ctrl.mass = mass
@@ -403,6 +405,7 @@ async def test_refresh_item_preserves_in_library_false() -> None:
 
     returned_item = Mock()
     returned_item.media_type = MediaType.TRACK
+    returned_item.provider_mappings = set()
 
     ctrl_mock = AsyncMock()
     ctrl_mock.get_provider_item = AsyncMock(return_value=fresh_item)
@@ -412,6 +415,7 @@ async def test_refresh_item_preserves_in_library_false() -> None:
     mass = Mock()
     mass.get_provider.return_value = Mock()
     mass.metadata = AsyncMock()
+    mass.cache.delete = AsyncMock()
 
     music_ctrl = MusicController.__new__(MusicController)
     music_ctrl.mass = mass
@@ -446,6 +450,7 @@ async def test_refresh_item_respects_provider_set_in_library() -> None:
 
     returned_item = Mock()
     returned_item.media_type = MediaType.TRACK
+    returned_item.provider_mappings = set()
 
     ctrl_mock = AsyncMock()
     ctrl_mock.get_provider_item = AsyncMock(return_value=fresh_item)
@@ -455,6 +460,7 @@ async def test_refresh_item_respects_provider_set_in_library() -> None:
     mass = Mock()
     mass.get_provider.return_value = Mock()
     mass.metadata = AsyncMock()
+    mass.cache.delete = AsyncMock()
 
     music_ctrl = MusicController.__new__(MusicController)
     music_ctrl.mass = mass
@@ -486,6 +492,7 @@ async def test_refresh_item_non_library_item_skips_update() -> None:
 
     mass = Mock()
     mass.get_provider.return_value = Mock()
+    mass.cache.delete = AsyncMock()
 
     music_ctrl = MusicController.__new__(MusicController)
     music_ctrl.mass = mass
@@ -936,8 +943,10 @@ async def test_set_provider_mappings_upsert_writes_explicit_in_library(
 async def test_library_items_default_filters_in_library_only() -> None:
     """Test that library_items passes in_library_only=True by default."""
     ctrl = Mock(spec=MediaControllerBase)
+    ctrl.media_type = MediaType.TRACK
     ctrl._ensure_provider_filter = Mock(return_value=None)
     ctrl.get_library_items_by_query = AsyncMock(return_value=[])
+    ctrl.resolve_sort = MediaControllerBase.resolve_sort.__get__(ctrl)
     ctrl.library_items = MediaControllerBase.library_items.__get__(ctrl)
 
     await ctrl.library_items()
@@ -950,8 +959,10 @@ async def test_library_items_default_filters_in_library_only() -> None:
 async def test_library_items_defaults_to_summary() -> None:
     """library_items defaults to summary=True so list endpoints return slim rows."""
     ctrl = Mock(spec=MediaControllerBase)
+    ctrl.media_type = MediaType.TRACK
     ctrl._ensure_provider_filter = Mock(return_value=None)
     ctrl.get_library_items_by_query = AsyncMock(return_value=[])
+    ctrl.resolve_sort = MediaControllerBase.resolve_sort.__get__(ctrl)
     ctrl.library_items = MediaControllerBase.library_items.__get__(ctrl)
 
     await ctrl.library_items()
@@ -1418,6 +1429,7 @@ async def test_provider_sync_suppresses_per_item_events() -> None:
     with (
         patch.object(MusicController, "active_sync_tasks", new_callable=PropertyMock) as tasks,
         patch.object(music_ctrl, "_queue_database_cleanup_task"),
+        patch.object(music_ctrl, "cleanup_library_shortcuts", Mock()),
     ):
         tasks.return_value = []
         await run_sync()

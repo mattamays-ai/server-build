@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import configparser
 import logging
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Final
@@ -390,6 +391,13 @@ def sanitize_m3u_value(value: str) -> str:
     :param value: Raw value (name, title, path or URL) about to be written to an M3U line.
     """
     return value.translate(_LINE_BREAK_TABLE)
+
+
+def sanitize_playlist_filename(name: str) -> str:
+    """Return the playlist name made safe to use as a file name."""
+    sanitized = re.sub(r'[<>:"/\\|?*]', "_", name)
+    sanitized = sanitized.strip(" .")
+    return sanitized or "untitled"
 
 
 def escape_markdown(value: str, table: bool = False) -> str:
@@ -937,18 +945,19 @@ def media_item_to_playlist_item(full_item: MediaItem) -> PlaylistItem:
     album_info = collect_album_info(full_item, preferred_instance=preferred_instance)
     podcast_info = collect_podcast_info(full_item, preferred_instance=preferred_instance)
 
-    # collect images
-    images: list[ImageInfo] = []
-    if hasattr(full_item, "metadata") and full_item.metadata and full_item.metadata.images:
-        for img in full_item.metadata.images:
-            images.append(
-                ImageInfo(
-                    type=img.type.value,
-                    path=img.path,
-                    provider=img.provider,
-                    remotely_accessible=img.remotely_accessible,
-                )
-            )
+    # collect images, for a track the image of its album first as that is the image it shows
+    item_images = UniqueList(full_item.metadata.images or [])
+    if isinstance(full_item, Track) and full_item.album and full_item.album.image:
+        item_images = UniqueList([full_item.album.image, *item_images])
+    images = [
+        ImageInfo(
+            type=img.type.value,
+            path=img.path,
+            provider=img.provider,
+            remotely_accessible=img.remotely_accessible,
+        )
+        for img in item_images
+    ]
 
     return PlaylistItem(
         path=primary_uri,

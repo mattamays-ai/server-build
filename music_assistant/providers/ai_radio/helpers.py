@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import datetime as dt
+import datetime
 import random
 import re
 from typing import Any
@@ -15,18 +15,12 @@ from music_assistant.controllers.webserver.helpers.auth_middleware import (
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     has_player_access as user_has_player_access,
 )
-from music_assistant.helpers.datetime import utc
 
-from .constants import EMPTY_SECTION_ID
+from .constants import EMPTY_SECTION_ID, FALLBACK_TRACK_SECONDS
 from .models import Slot
 
 
-def utc_now_iso() -> str:
-    """Return a UTC ISO timestamp."""
-    return utc().isoformat()
-
-
-def format_ai_radio_timestamp(moment: dt.datetime) -> str:
+def format_ai_radio_timestamp(moment: datetime.datetime) -> str:
     """Format a moment for the <timestamp> placeholder, spelling out the weekday and month."""
     # spelled out so the LLM never has to derive the weekday from a numeric date
     return moment.strftime("%A %d %B %Y, %H:%M %Z")
@@ -86,7 +80,11 @@ def build_slots(tracks: list[dict[str, Any]]) -> list[Slot]:
     total = 0.0
     for track in tracks:
         duration = track.get("duration")
-        seconds = float(duration) if isinstance(duration, (int, float)) and duration > 0 else 210.0
+        seconds = (
+            float(duration)
+            if isinstance(duration, (int, float)) and duration > 0
+            else float(FALLBACK_TRACK_SECONDS)
+        )
         total += seconds / 60.0
         cumulative_minutes.append(total)
 

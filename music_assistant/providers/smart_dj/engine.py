@@ -32,6 +32,14 @@ class DJWeights:
     clap: float = 0.05
 
 
+# Segue-quality scoring: how well two tracks' quiet EDGES overlap, from the same
+# RMS math the transition planner runs at playback time. Not a user control - it
+# is an intrinsic quality term that abstains silently when either track lacks
+# RMS analysis, and it scales with the transition aggressiveness like momentum.
+SEGUE_QUALITY_WEIGHT: float = 0.12
+_SEGUE_FULL_SCORE_SECONDS: float = 10.0
+
+
 @dataclass(frozen=True, slots=True)
 class DJMode:
     """A named DJ preset: tolerances, preferred energy direction, and weights."""
@@ -69,6 +77,11 @@ class DJControls:
     transition_bars_overrides: dict[str, int] = field(default_factory=dict)
     automix_enabled: bool = False
     smart_reorder_enabled: bool = True
+    # Vocal-duck toggle for the crossfade overlap (smart_fades/stems.py): when
+    # True, pinned transitions duck the outgoing vocal instead of playing the
+    # double-vocal handoff. Soft: degrades to the plain blend when the
+    # separation runtime/model is unavailable.
+    stems_enabled: bool = False
     lookahead: int = 8
     # Blend style preference passed to the smart-fades planner: auto (engine
     # decides), full_blend (force the 16-bar blend when the grid allows),
@@ -223,7 +236,13 @@ def _artist_run_length(
     return count
 
 
-def _hard_fail(  # noqa: PLR0915 - every hard rule reads clearest inline
+# Stretch-gate ceiling per beat_strictness setting: the maximum BPM-difference
+# fraction the hard BPM gate will accept. strict=6%, normal=8% (default),
+# aggressive=12%, matching the documented DJControls.beat_strictness contract.
+BEAT_STRETCH_LIMITS = {"strict": 0.06, "normal": 0.08, "aggressive": 0.12}
+
+
+def _hard_fail(  # noqa: PLR0915,C901,PLR0912 - every hard rule reads clearest inline
     current: dict[str, Any] | None,
     candidate: dict[str, Any],
     controls: DJControls,
@@ -279,8 +298,19 @@ def _hard_fail(  # noqa: PLR0915 - every hard rule reads clearest inline
         a = current.get("bpm")
         if not isinstance(a, (int, float)) or not isinstance(bpm, (int, float)):
             violations.append("hard BPM compatibility unavailable")
-        elif abs(float(bpm) - float(a)) > float(a) * 0.08:
-            violations.append("hard BPM compatibility")
+        else:
+            # Stretch gate scaled by beat_strictness (strict=6%, normal=8%,
+            # aggressive=12% - the documented DJControls contract) and tightened
+            # to half the window when either side carries vocals: vocal
+            # material audibly tears around +-3% pitch shift.
+            either_vocal = candidate.get("instrumental") is not True or (
+                current.get("instrumental") is not True
+            )
+            limit = BEAT_STRETCH_LIMITS.get(controls.beat_strictness, 0.08)
+            if either_vocal:
+                limit *= 0.5
+            if abs(float(bpm) - float(a)) > float(a) * limit:
+                violations.append("hard BPM compatibility")
 
     if controls.key.state == "hard" and current:
         a, b = current.get("camelot"), candidate.get("camelot")
@@ -318,9 +348,11 @@ def _hard_fail(  # noqa: PLR0915 - every hard rule reads clearest inline
     ):
         violations.append("hard artist spacing")
 
-    if artist_run_length >= max(1, controls.max_artist_repeat):
-        violations.append("maximum consecutive artist repeat exceeded")
-
+    # "soft" spacing is a graded score penalty in _signal_values (the
+    # artist_spacing value decays to zero as the run length reaches the cap);
+    # "disabled" must neither veto nor penalize. The old unconditional veto
+    # made max_artist_repeat=1 (the default) reject EVERY same-artist
+    # follow-up regardless of the user's soft/disabled setting.
     return violations
 
 
@@ -398,9 +430,81 @@ def _signal_values(
             total -= 0.35
             total_weight += 0.35
             reasons.append("key softened: incompatible step accepted")
+    if current is not None:
+        quality = segue_quality(current, candidate)
+        if quality is not None:
+            effective = SEGUE_QUALITY_WEIGHT * (0.5 + controls.transition_aggressiveness)
+            total += quality * effective
+            total_weight += effective
+            reasons.append(
+                "quiet-edge overlap strong" if quality >= 0.7 else "quiet-edge overlap weak"
+            )
     if total_weight == 0:
         return 0.5, reasons
     return max(0.0, min(1.0, total / total_weight)), reasons
+
+
+def _rms_arrays(track: dict[str, Any]) -> tuple[Any, float] | None:
+    """Return (rms bins, track duration) for a merged track dict, or None without analysis."""
+    rms = track.get("rms_energy")
+    duration = track.get("duration")
+    if rms is None:
+        analysis = track.get("analysis")
+        if isinstance(analysis, dict):
+            rms = analysis.get("rms_energy")
+            duration = duration or analysis.get("duration")
+    if not rms:
+        return None
+    if not duration:
+        # no duration on the track dict: the beat grids are media time, so the
+        # last beat plus one beat of the track's own tempo is a close estimate
+        beats = track.get("beats") or (track.get("analysis") or {}).get("beats")
+        bpm = float(track.get("bpm") or 0)
+        if not beats or bpm <= 0:
+            return None
+        duration = float(beats[-1]) + 60.0 / bpm
+    return rms, float(duration)
+
+
+def segue_quality(current: dict[str, Any], candidate: dict[str, Any]) -> float | None:
+    """
+    Estimate how well the pair's quiet edges overlap, or None without analysis.
+
+    The quiet-tail / quiet-head detection the transition planner runs at
+    playback time, evaluated at reorder time from the RMS arrays the provider
+    already carries - no audio buffers involved. 1.0 = a >=10s quiet-edge
+    overlap, 0.0 = both edges slam.
+    """
+    import numpy as np  # noqa: PLC0415
+
+    from music_assistant.controllers.streams.smart_fades.helpers import (  # noqa: PLC0415
+        SEGUE_ENERGY_FRACTION,
+        detect_mix_out_point,
+        detect_rise_point,
+    )
+
+    out = _rms_arrays(current)
+    in_ = _rms_arrays(candidate)
+    if out is None or in_ is None:
+        return None
+    out_rms, out_dur = np.asarray(out[0], dtype=np.float32), out[1]
+    in_rms, in_dur = np.asarray(in_[0], dtype=np.float32), in_[1]
+    if len(out_rms) < 2 or len(in_rms) < 2:
+        return None
+    out_bpm = float(current.get("bpm") or 120)
+    in_bpm = float(candidate.get("bpm") or 120)
+    out_bpb = int(current.get("beats_per_bar") or 4)
+    in_bpb = int(candidate.get("beats_per_bar") or 4)
+    # the whole tail is the search window: the detection finds where it decays
+    point = detect_mix_out_point(
+        out_rms, out_dur, out_dur, out_bpm, fraction=SEGUE_ENERGY_FRACTION, beats_per_bar=out_bpb
+    )
+    quiet_tail = max(0.0, out_dur - point)
+    quiet_head = detect_rise_point(
+        in_rms, in_dur, in_bpm, SEGUE_ENERGY_FRACTION, beats_per_bar=in_bpb
+    )
+    overlap = min(quiet_tail + quiet_head, _SEGUE_FULL_SCORE_SECONDS)
+    return min(1.0, overlap / _SEGUE_FULL_SCORE_SECONDS)
 
 
 def score_candidate(

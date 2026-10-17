@@ -274,9 +274,9 @@ def test_missing_analysis_is_a_violation() -> None:
     assert violations == ["missing analysis"]
 
 
-def test_artist_repeat_limit_is_enforced() -> None:
-    """Consecutive same-artist tracks are capped by max_artist_repeat."""
-    controls = DJControls(max_artist_repeat=1)
+def test_artist_repeat_hard_state_vetoes() -> None:
+    """Hard artist_spacing vetoes a same-artist follow-up at the cap."""
+    controls = DJControls(max_artist_repeat=1, artist_spacing=SignalControl(state="hard"))
     _, _, violations = score_candidate(
         _track(),
         _track(artist="A"),
@@ -284,7 +284,40 @@ def test_artist_repeat_limit_is_enforced() -> None:
         controls,
         artist_run_length=1,
     )
-    assert "maximum consecutive artist repeat exceeded" in violations
+    assert "hard artist spacing" in violations
+
+
+def test_artist_repeat_soft_state_penalizes_without_veto() -> None:
+    """
+    Soft artist_spacing scores the follow-up instead of rejecting it.
+
+    Regression guard: the engine used to fire an unconditional veto here,
+    so the default (soft) setting rejected EVERY same-artist follow-up.
+    """
+    controls = DJControls(max_artist_repeat=1, artist_spacing=SignalControl(state="soft"))
+    score, _, violations = score_candidate(
+        _track(),
+        _track(artist="A"),
+        MODES["ai_dj"],
+        controls,
+        artist_run_length=1,
+    )
+    assert violations == []
+    assert score > 0.0
+
+
+def test_artist_repeat_disabled_state_allows() -> None:
+    """Disabled artist_spacing neither vetoes nor penalizes a repeat."""
+    controls = DJControls(max_artist_repeat=1, artist_spacing=SignalControl(state="disabled"))
+    score, _, violations = score_candidate(
+        _track(),
+        _track(artist="A"),
+        MODES["ai_dj"],
+        controls,
+        artist_run_length=1,
+    )
+    assert violations == []
+    assert score > 0.0
 
 
 # ---------------------------------------------------------------------------

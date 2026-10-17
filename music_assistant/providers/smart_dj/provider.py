@@ -9,6 +9,7 @@ import os
 import tempfile
 import time
 from contextlib import suppress
+from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -24,11 +25,16 @@ from music_assistant_models.enums import (
     QueueOption,
 )
 
+from music_assistant.constants import (
+    CONF_BACKGROUND_SCAN_CONCURRENCY,
+    DEFAULT_BACKGROUND_SCAN_CONCURRENCY,
+)
 from music_assistant.controllers.player_queues.helpers import build_queue_item
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.controllers.streams.constants import BufferMode, BufferSize
 from music_assistant.helpers.app_vars import app_var
 from music_assistant.helpers.audio import decoded_pcm_format
+from music_assistant.models.music_provider import MusicProvider
 from music_assistant.models.plugin import PluginProvider
 
 from .engine import (
@@ -38,6 +44,7 @@ from .engine import (
     SignalControl,
     _merge_track,
     beam_optimize,
+    camelot_affinity,
 )
 
 if TYPE_CHECKING:
@@ -66,6 +73,14 @@ AUTOMIX_MAX_CROSSFADE = 60.0
 # at 10 minutes) and a poll interval for detecting stored results.
 PREROLL_ANALYSIS_TIMEOUT = 600
 PREROLL_POLL_SECONDS = 5
+
+# Library-wide local analysis sweep safeguards. The sweep must never make
+# the box feel bad: it defers to active playback, runs at most a handful of
+# tracks at a time, and aborts rather than hammering a broken provider.
+LIBRARY_SCAN_MAX_TRACKS = 10000
+LIBRARY_SCAN_POLL_SECONDS = 10.0
+LIBRARY_SCAN_MAX_FAILURES = 50
+LIBRARY_SCAN_MAX_ERRORS_SHOWN = 5
 
 
 def _automix_durations(tracks: list[dict[str, Any]], control: DJControls) -> dict[str, float]:
@@ -106,6 +121,105 @@ def _automix_durations(tracks: list[dict[str, Any]], control: DJControls) -> dic
     return durations
 
 
+# genre keyword -> (transition_style, beat_strictness) applied when the user's
+# style pin is "auto"; the first keyword hit wins, an explicit user pick always
+# wins, and an unmatched genre keeps the engine defaults
+GENRE_PROFILES: tuple[tuple[str, tuple[str, str]], ...] = (
+    # beatmatchable, four-on-the-floor material: the full DJ blend is the point
+    ("house", ("full_blend", "normal")),
+    ("techno", ("full_blend", "normal")),
+    ("trance", ("full_blend", "normal")),
+    ("electro", ("full_blend", "normal")),
+    ("disco", ("full_blend", "normal")),
+    ("dance", ("full_blend", "normal")),
+    ("funk", ("full_blend", "aggressive")),
+    # halved/double-time meters: blendable but only within a tight stretch range
+    ("drum and bass", ("full_blend", "strict")),
+    ("drum & bass", ("full_blend", "strict")),
+    ("jungle", ("full_blend", "strict")),
+    ("dubstep", ("full_blend", "strict")),
+    # vocal-dense or live material: nothing to beatmatch, hand over sequentially
+    ("hip hop", ("radio", "strict")),
+    ("hip-hop", ("radio", "strict")),
+    ("rap", ("radio", "strict")),
+    ("rock", ("radio", "aggressive")),
+    ("pop", ("radio", "aggressive")),
+    ("punk", ("radio", "aggressive")),
+    ("metal", ("radio", "aggressive")),
+    ("indie", ("radio", "aggressive")),
+    ("jazz", ("radio", "aggressive")),
+    ("classical", ("radio", "aggressive")),
+    ("ambient", ("radio", "aggressive")),
+    ("soundtrack", ("radio", "aggressive")),
+    ("folk", ("radio", "aggressive")),
+    ("soul", ("radio", "aggressive")),
+)
+
+
+def _genre_profile(genre: str | None) -> tuple[str, str] | None:
+    """Match a track's genre string against the per-genre profile table."""
+    if not genre:
+        return None
+    lowered = genre.lower()
+    for keyword, profile in GENRE_PROFILES:
+        if keyword in lowered:
+            return profile
+    return None
+
+
+def _transition_report(
+    ordered: list[dict[str, Any]],
+    control: DJControls,
+) -> list[dict[str, Any]]:
+    """
+    One self-explanation note per planned boundary, in playback order.
+
+    Plan-time facts only: the renderer still picks the final rendered style
+    per pair at blend time (its selection sees beat grids and vocal windows
+    the plan does not). These are the inputs that decision reads: tempo
+    delta, key affinity, vocal-collision risk, and which style/strictness
+    the boundary is pinned to -- plus where that pin came from.
+    """
+    notes: list[dict[str, Any]] = []
+    for current, candidate in pairwise(ordered):
+        # callers feed either nested rows ({"analysis": {...}} from queue/
+        # playlist snapshots) or flat dicts; analysis keys lose to the
+        # top level so overrides stay authoritative
+        cur = {**(current.get("analysis") or {}), **current}
+        cand = {**(candidate.get("analysis") or {}), **candidate}
+        a, b = cur.get("bpm"), cand.get("bpm")
+        bpm_delta_pct = (
+            round(abs(float(b) - float(a)) / float(a) * 100, 2)
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)) and float(a)
+            else None
+        )
+        camelot_a, camelot_b = cur.get("camelot"), cand.get("camelot")
+        key_distance = camelot_affinity(camelot_a, camelot_b) if camelot_a and camelot_b else None
+        style = control.transition_style
+        strictness = control.beat_strictness
+        source = "user" if style != "auto" else None
+        if source is None:
+            profile = _genre_profile(cand.get("genre"))
+            if profile is not None:
+                style, strictness, source = profile[0], profile[1], "genre"
+            else:
+                # style stays "auto": the planner decides per pair at blend time
+                source = "engine"
+        notes.append(
+            {
+                "to": cand.get("name"),
+                "bpm_delta_pct": bpm_delta_pct,
+                "key_distance": key_distance,
+                "both_vocal": cur.get("instrumental") is not True
+                and cand.get("instrumental") is not True,
+                "style": style,
+                "strictness": strictness,
+                "source": source,
+            }
+        )
+    return notes
+
+
 def _automix_blend_prefs(
     tracks: list[dict[str, Any]], control: DJControls
 ) -> dict[str, tuple[str, str]]:
@@ -114,13 +228,21 @@ def _automix_blend_prefs(
 
     Same keys as the duration pins (the blend INTO each track reads its own
     pref). Style "auto" + strictness "normal" means engine defaults, which the
-    streams-side getter collapses to no pin at all.
+    streams-side getter collapses to no pin at all. With the style on "auto",
+    a per-genre profile fills the pin from the track's genre; an explicit user
+    pick always wins.
     """
-    return {
-        str(track.get("queue_item_id")): (control.transition_style, control.beat_strictness)
-        for track in tracks
-        if track.get("queue_item_id") is not None
-    }
+    prefs: dict[str, tuple[str, str]] = {}
+    for track in tracks:
+        if track.get("queue_item_id") is None:
+            continue
+        style, strictness = control.transition_style, control.beat_strictness
+        if style == "auto":
+            profile = _genre_profile(track.get("genre"))
+            if profile is not None:
+                style, strictness = profile
+        prefs[str(track.get("queue_item_id"))] = (style, strictness)
+    return prefs
 
 
 def _camelot_from_key(key: str | None, mode: str | None) -> str | None:
@@ -311,6 +433,95 @@ def _bpm_tolerance(value: Any) -> float:
     return max(0.01, min(1.0, tol))
 
 
+async def _fetch_radio_tracks(
+    request: Any,
+    seed: dict[str, Any],
+    count: int,
+) -> list[Any]:
+    """
+    Fetch Musicae radio seeds (primary path 2026 docs, flat variant once).
+
+    Auth/quota failures surface as MusicaeRateLimited with their identity
+    intact; only shape/transport problems are aggregated into one error.
+    """
+    limit = max(1, min(int(count), 50))
+    errors = []
+    data = None
+    for path, params in (
+        (f"/v2/tracks/{seed['item_id']}/radio", {"limit": limit}),
+        ("/v2/radio", {"seed_id": seed["item_id"], "limit": limit}),
+    ):
+        try:
+            data = await request(path, params)
+            break
+        except MusicaeRateLimited:
+            raise  # auth/quota failures keep their identity; do not flatten
+        except RuntimeError as err:
+            errors.append(f"{path}: {err}")
+    if not data:
+        raise RuntimeError("Musicae radio failed - " + " | ".join(errors))
+    raw_tracks = data.get("tracks") if isinstance(data, dict) else None
+    if not isinstance(raw_tracks, list):
+        raise RuntimeError(  # noqa: TRY004 - vendor shape, not a type error
+            f"Unexpected Musicae radio response shape: {str(raw_tracks)[:300]}"
+        )
+    return raw_tracks
+
+
+async def _playlist_analysis_rows(
+    provider: Any,
+    resolved: list[Any],
+    analysis_provider: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """
+    Analyze resolved playlist tracks; shared by mix_playlist + save_sorted.
+
+    Returns (analyzed rows with mix- ids and nested analysis, media_by_id
+    mapping mix- id -> the resolved media item). Analysis failures are kept
+    as rows with analysis=None; the optimizer scores them last.
+    """
+    analysis_rows: list[dict[str, Any]] = []
+    media_by_id: dict[str, Any] = {}
+    for idx, track in enumerate(resolved):
+        metadata = getattr(track, "metadata", None)
+        genres = list(getattr(metadata, "genres", None) or [])
+        mix_id = f"mix-{idx}"
+        analysis_rows.append(
+            {
+                "queue_item_id": mix_id,
+                "name": track.name,
+                "artist": getattr(track, "artist_str", None) or getattr(track, "artist", None),
+                "item_id": track.item_id,
+                "provider": getattr(track, "provider", None)
+                or getattr(track, "provider_instance", None),
+                "genre": genres[0] if genres else None,
+                "genres": genres,
+                "explicit": getattr(metadata, "explicit", None) if metadata else None,
+            }
+        )
+        media_by_id[mix_id] = track
+
+    tasks = [
+        asyncio.create_task(
+            provider._analysis(
+                item["item_id"],
+                item["provider"],
+                {k: item[k] for k in ("genre", "genres", "explicit") if k in item},
+                analysis_provider,
+            )
+        )
+        for item in analysis_rows
+    ]
+    analyses = await asyncio.gather(*tasks, return_exceptions=True)
+    analyzed: list[dict[str, Any]] = []
+    for item, result in zip(analysis_rows, analyses, strict=True):
+        analysis = None if isinstance(result, Exception) else result
+        if isinstance(result, Exception):
+            provider.logger.debug("Smart DJ analysis failed for %s: %s", item["item_id"], result)
+        analyzed.append({**item, "analysis": analysis})
+    return analyzed, media_by_id
+
+
 class SmartDJProvider(PluginProvider):
     """Native Smart DJ controller and Musicae enrichment client."""
 
@@ -435,30 +646,15 @@ class SmartDJProvider(PluginProvider):
         if not spotify_instances:
             raise RuntimeError("Complete mix requires a Spotify provider instance")
         spotify_instance = spotify_instances[0].instance_id
+        # the controls param was previously dead (audit note); it now feeds
+        # the transition report so the notes reflect the caller's pins
+        control = self._parse_controls(dict(controls or {}), 0.08, True, True, "ai_dj")
 
         # Musicae radio: primary path per the 2026 docs, seeded by one track id.
         # The endpoint shape is path-parameterized (/v2/tracks/{id}/radio); if
         # that 404s, try the flat variant once. A wrong path raises with both
         # response bodies so the shape is visible in the error.
-        limit = max(1, min(int(count), 50))
-        errors = []
-        data = None
-        for path, params in (
-            (f"/v2/tracks/{seed['item_id']}/radio", {"limit": limit}),
-            ("/v2/radio", {"seed_id": seed["item_id"], "limit": limit}),
-        ):
-            try:
-                data = await self._request(path, params)
-                break
-            except RuntimeError as err:
-                errors.append(f"{path}: {err}")
-        if not data:
-            raise RuntimeError("Musicae radio failed - " + " | ".join(errors))
-        raw_tracks = data.get("tracks") if isinstance(data, dict) else None
-        if not isinstance(raw_tracks, list):
-            raise RuntimeError(  # noqa: TRY004 - vendor shape, not a type error
-                f"Unexpected Musicae radio response shape: {str(data)[:300]}"
-            )
+        raw_tracks = await _fetch_radio_tracks(self._request, seed, count)
 
         tracks: list[Any] = []
         seen: set[str] = set()
@@ -473,7 +669,7 @@ class SmartDJProvider(PluginProvider):
                 self.logger.debug("Musicae radio track %s not resolvable: %s", track_id, err)
                 continue
             tracks.append(track)
-            if len(tracks) >= limit:
+            if len(tracks) >= max(1, min(int(count), 50)):
                 break
         if not tracks:
             raise RuntimeError("Musicae radio returned no tracks resolvable via Spotify")
@@ -502,6 +698,7 @@ class SmartDJProvider(PluginProvider):
             "seed": seed.get("name"),
             "added": [track.name for track in tracks],
             "automix_pinned": automix_pinned,
+            "transition_notes": _transition_report([seed, *tracks], control),
         }
 
     async def analyze_library(
@@ -568,8 +765,12 @@ class SmartDJProvider(PluginProvider):
                     "/v2/audio-analysis/" + ",".join(musicae_id for _, musicae_id in chunk),
                     {},
                 )
+            except MusicaeRateLimited:
+                quota_exhausted = True
+                break
             except RuntimeError as err:
                 if "429" in str(err):
+                    # fallback for raw vendor 429s that never became typed
                     quota_exhausted = True
                     break
                 errors.append(str(err)[:200])
@@ -646,45 +847,7 @@ class SmartDJProvider(PluginProvider):
         if len(resolved) < 2:
             raise RuntimeError("Playlist tracks could not be resolved for mixing")
 
-        analysis_rows: list[dict[str, Any]] = []
-        media_by_id: dict[str, Any] = {}
-        for idx, track in enumerate(resolved):
-            metadata = getattr(track, "metadata", None)
-            genres = list(getattr(metadata, "genres", None) or [])
-            mix_id = f"mix-{idx}"
-            analysis_rows.append(
-                {
-                    "queue_item_id": mix_id,
-                    "name": track.name,
-                    "artist": getattr(track, "artist_str", None) or getattr(track, "artist", None),
-                    "item_id": track.item_id,
-                    "provider": getattr(track, "provider", None)
-                    or getattr(track, "provider_instance", None),
-                    "genre": genres[0] if genres else None,
-                    "genres": genres,
-                    "explicit": getattr(metadata, "explicit", None) if metadata else None,
-                }
-            )
-            media_by_id[mix_id] = track
-
-        tasks = [
-            asyncio.create_task(
-                self._analysis(
-                    item["item_id"],
-                    item["provider"],
-                    {k: item[k] for k in ("genre", "genres", "explicit") if k in item},
-                    analysis_provider,
-                )
-            )
-            for item in analysis_rows
-        ]
-        analyses = await asyncio.gather(*tasks, return_exceptions=True)
-        analyzed: list[dict[str, Any]] = []
-        for item, result in zip(analysis_rows, analyses, strict=True):
-            analysis = None if isinstance(result, Exception) else result
-            if isinstance(result, Exception):
-                self.logger.debug("Smart DJ analysis failed for %s: %s", item["item_id"], result)
-            analyzed.append({**item, "analysis": analysis})
+        analyzed, media_by_id = await _playlist_analysis_rows(self, resolved, analysis_provider)
 
         preset = MODES.get(mode, MODES["ai_dj"])
         selected_mode = DJMode(
@@ -779,6 +942,7 @@ class SmartDJProvider(PluginProvider):
                         if mix_id in id_map
                     }
                 )
+                self.mass.streams.audio.set_automix_stems(control.stems_enabled)
                 self.mass.create_task(self.preroll_queue_analysis(queue_id, 10))
                 automix_info = {
                     "enabled": True,
@@ -848,6 +1012,7 @@ class SmartDJProvider(PluginProvider):
                     if mix_id in fresh_ids
                 }
             )
+            self.mass.streams.audio.set_automix_stems(control.stems_enabled)
             # silent background preroll: analyze upcoming tracks so blends
             # improve as the queue plays (no audible output)
             self.mass.create_task(self.preroll_queue_analysis(queue_id, 10))
@@ -883,9 +1048,25 @@ class SmartDJProvider(PluginProvider):
         snapshot = await self.analyze(queue_id, analysis_provider=analysis_provider)
         tracks = snapshot["tracks"]
         if len(tracks) < 2:
-            return snapshot
+            # Keep the rank contract shape even when there is nothing to rank:
+            # the FE reads applied/queue_changed/automix on every response and
+            # the raw analyze payload carries none of them.
+            return {
+                "queue_id": queue_id,
+                "current_item_id": tracks[0]["queue_item_id"] if tracks else None,
+                "tracks": [],
+                "optimized_window": len(tracks),
+                "queue_item_count": snapshot.get("queue_item_count"),
+                "applied": False,
+                "queue_changed": False,
+                "automix_applied": False,
+                "automix": None,
+                "reason": "not_enough_tracks",
+                "settings": {"controls": raw, "mode": mode},
+            }
 
         control = self._parse_controls(raw, bpm_tolerance, prefer_keys, preserve_variety, mode)
+        automix_pin: dict[str, Any] | None = None
         if not control.smart_reorder_enabled:
             if apply and control.automix_enabled:
                 # Real AutoMix execution: the queue-level crossfade toggle is a
@@ -898,6 +1079,7 @@ class SmartDJProvider(PluginProvider):
                 self.mass.streams.audio.set_automix_blend_prefs(
                     _automix_blend_prefs(tracks[1:], control)
                 )
+                self.mass.streams.audio.set_automix_stems(control.stems_enabled)
                 self.mass.create_task(self.preroll_queue_analysis(queue_id, 10))
                 automix_pin = {
                     "enabled": True,
@@ -983,6 +1165,7 @@ class SmartDJProvider(PluginProvider):
                 # automix off in this plan: release any previously pinned lengths
                 self.mass.streams.audio.set_automix_durations({})
                 self.mass.streams.audio.set_automix_blend_prefs({})
+                self.mass.streams.audio.set_automix_stems(False)
             if control.automix_enabled:
                 # Real AutoMix execution: hand the queue to the streams engine's
                 # crossfade path (smart fades when analysis is available, standard
@@ -994,6 +1177,7 @@ class SmartDJProvider(PluginProvider):
                 self.mass.streams.audio.set_automix_blend_prefs(
                     _automix_blend_prefs(optimized, control)
                 )
+                self.mass.streams.audio.set_automix_stems(control.stems_enabled)
                 self.mass.create_task(self.preroll_queue_analysis(queue_id, 10))
                 automix_info = {
                     "enabled": True,
@@ -1003,6 +1187,7 @@ class SmartDJProvider(PluginProvider):
             "queue_id": queue_id,
             "current_item_id": tracks[0]["queue_item_id"],
             "tracks": optimized,
+            "transition_notes": _transition_report([tracks[0], *optimized], control),
             "optimized_window": len(tracks),
             "queue_item_count": snapshot.get("queue_item_count"),
             # "applied" means THE QUEUE WAS MUTATED and nothing else
@@ -1048,7 +1233,15 @@ class SmartDJProvider(PluginProvider):
                 # beam width = lookahead x 3, capped at 96: the top slider stop
                 # already buys a 96-wide search (the FE label says so now)
                 "lookahead_beam_cap": 96,
-                "transition_styles": ["auto", "full_blend", "energy", "quick_cut"],
+                "transition_styles": [
+                    "auto",
+                    "full_blend",
+                    "energy",
+                    "quick_cut",
+                    "radio",
+                    "echo_out",
+                    "filter_out",
+                ],
                 "beat_strictness": ["strict", "normal", "aggressive"],
                 "complete_mix": True,
                 "preroll_analysis": True,
@@ -1104,6 +1297,10 @@ class SmartDJProvider(PluginProvider):
         self._tmp_index_path: str | None = None
         self._orig_index_path: str | None = None
         self._unregister_ui_route: Any = None
+        # Library-wide local analysis sweep state (smart_dj/analyze_library_local).
+        self._library_scan_task: asyncio.Task[None] | None = None
+        self._library_scan_cancel = asyncio.Event()
+        self._library_scan_state: dict[str, Any] = {}
 
     async def loaded_in_mass(self) -> None:
         """Register the Smart DJ API commands and load the persistent cache."""
@@ -1119,6 +1316,7 @@ class SmartDJProvider(PluginProvider):
             ("smart_dj/analyze", self.analyze, Scope.LIBRARY_WRITE),
             ("smart_dj/rank_queue", self.rank_queue, Scope.LIBRARY_WRITE),
             ("smart_dj/mix_playlist", self.mix_playlist, Scope.LIBRARY_WRITE),
+            ("smart_dj/save_sorted_playlist", self.save_sorted_playlist, Scope.LIBRARY_WRITE),
             ("smart_dj/status", self.status, None),
             ("smart_dj/capabilities", self.capabilities, None),
             (
@@ -1128,6 +1326,13 @@ class SmartDJProvider(PluginProvider):
             ),
             ("smart_dj/complete_mix", self.complete_mix, Scope.LIBRARY_WRITE),
             ("smart_dj/analyze_library", self.analyze_library, Scope.LIBRARY_WRITE),
+            ("smart_dj/analyze_playlist", self.analyze_playlist, Scope.LIBRARY_WRITE),
+            ("smart_dj/analyze_library_local", self.analyze_library_local, Scope.LIBRARY_WRITE),
+            (
+                "smart_dj/create_analyzed_playlist",
+                self.create_analyzed_playlist,
+                Scope.LIBRARY_WRITE,
+            ),
         )
         for command, handler, required_scope in handlers:
             self._handles.append(
@@ -1137,6 +1342,13 @@ class SmartDJProvider(PluginProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Close the HTTP client, drop the UI, and unregister commands."""
+        scan_task = self._library_scan_task
+        if scan_task is not None and not scan_task.done():
+            self._library_scan_cancel.set()
+            scan_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await scan_task
+        self._library_scan_task = None
         self._teardown_ui()
         for handle in self._handles:
             handle()
@@ -1145,6 +1357,302 @@ class SmartDJProvider(PluginProvider):
             await self._session.close()
             self._session = None
         await super().unload(is_removed)
+
+    async def analyze_playlist(
+        self,
+        playlist_item_id: str,
+        playlist_provider: str,
+        limit: int = 500,
+    ) -> dict[str, Any]:
+        """
+        Analyze a playlist's unanalyzed tracks in the background.
+
+        Each track is streamed silently through the LOCAL ML analysis providers
+        (no playback, no audible output, audio never stored) and the result is
+        persisted in the analysis database, so the Smart DJ optimizer and the
+        smart-fades planner have beat grids and RMS to work with. No Musicae
+        quota is consumed. Concurrency follows the streams background-scan
+        setting (default 2, clamped here to 1-8).
+        """
+        if not self.mass.streams.audio_analysis.providers:
+            raise RuntimeError("No audio analysis providers are loaded")
+        cap = max(1, min(int(limit), 2000))
+        tracks: list[Any] = [
+            item
+            async for item in self.mass.music.playlists.tracks(playlist_item_id, playlist_provider)
+        ][:cap]
+        # resolve lightweight item mappings to full tracks (provider/item ids usable)
+        resolved: list[Any] = []
+        for track in tracks:
+            if getattr(track, "metadata", None) is None and getattr(track, "item_id", None):
+                with suppress(Exception):
+                    track = await self.mass.music.tracks.get(  # noqa: PLW2901
+                        track.item_id, track.provider
+                    )
+            if getattr(track, "item_id", None) and getattr(track, "provider", None):
+                resolved.append(track)
+        concurrency = self._background_concurrency()
+
+        sem = asyncio.Semaphore(concurrency)
+        analyzed: list[str] = []
+        skipped: list[str] = []
+        failed: dict[str, str] = {}
+
+        async def _one(track: Any) -> None:
+            async with sem:
+                try:
+                    done = await self._analyze_media_silent(track.item_id, track.provider)
+                except Exception as err:
+                    failed[str(track.item_id)] = str(err)
+                    return
+                if done:
+                    analyzed.append(str(track.item_id))
+                else:
+                    skipped.append(str(track.item_id))
+
+        await asyncio.gather(*(_one(t) for t in resolved))
+        return {
+            "playlist_item_id": playlist_item_id,
+            "total": len(resolved),
+            "analyzed": analyzed,
+            "skipped": skipped,
+            "failed": failed,
+            "concurrency": concurrency,
+        }
+
+    async def analyze_library_local(
+        self,
+        command: str = "start",
+        pause_while_playing: bool = True,
+        limit: int = 0,
+    ) -> dict[str, Any]:
+        """
+        Start, poll, or cancel the library-wide LOCAL analysis sweep.
+
+        Streams every unanalyzed library track silently through the local ML
+        analysis providers (no playback, no audible output, audio never
+        stored, no Musicae quota) so the Smart DJ optimizer and the smart-fades
+        planner have beat grids and RMS for the whole library.
+
+        Safeguards:
+        - ``command="start"`` is idempotent: a second start while a sweep is
+          running just returns the live progress.
+        - ``pause_while_playing=True`` (the default) defers ALL dispatch while
+          any player is PLAYING - the local analyzer is CPU-hungry and must
+          never compete with live audio decode.
+        - concurrency follows the streams background-scan setting (1-8,
+          default 2); each track has a hard timeout and its buffer is always
+          torn down.
+        - a circuit breaker aborts the sweep after
+          ``LIBRARY_SCAN_MAX_FAILURES`` consecutive failures instead of
+          hammering a broken provider.
+        - ``command="cancel"`` stops the sweep between tracks; already-stored
+          analysis is kept, so a re-run resumes effectively for free.
+
+        ``limit`` caps how many library tracks the sweep considers (0 = up to
+        ``LIBRARY_SCAN_MAX_TRACKS``).
+        """
+        if command not in {"start", "status", "cancel"}:
+            raise RuntimeError("command must be one of start, status, cancel")
+        if command == "status":
+            return dict(self._library_scan_state)
+        if command == "cancel":
+            self._library_scan_cancel.set()
+            task = self._library_scan_task
+            if task is not None and not task.done():
+                # cancelling the worker task interrupts any in-flight track
+                # too; _analyze_media_silent's finally always tears the buffer
+                # down, so an interrupted track leaves nothing half-done
+                self._library_scan_state["cancelled"] = True
+                task.cancel()
+            return dict(self._library_scan_state)
+        if self._library_scan_task is not None and not self._library_scan_task.done():
+            return dict(self._library_scan_state)
+        if not self.mass.streams.audio_analysis.providers:
+            raise RuntimeError("No audio analysis providers are loaded")
+        cap = (
+            LIBRARY_SCAN_MAX_TRACKS
+            if int(limit) <= 0
+            else max(1, min(int(limit), LIBRARY_SCAN_MAX_TRACKS))
+        )
+        library_tracks = await self.mass.music.tracks.library_items(
+            favorite=None,
+            search=None,
+            limit=cap,
+            offset=0,
+            order_by="sort_name",
+            summary=False,
+        )
+        targets: list[Any] = [
+            item
+            for item in library_tracks
+            if getattr(item, "item_id", None) and getattr(item, "provider", None)
+        ]
+        self._library_scan_cancel.clear()
+        self._library_scan_state = {
+            "running": True,
+            "total": len(targets),
+            "analyzed": 0,
+            "skipped": 0,
+            "failed": 0,
+            "errors": [],
+            "deferring": False,
+            "cancelled": False,
+            "started_at": time.time(),
+            "finished_at": None,
+        }
+        self._library_scan_task = asyncio.create_task(
+            self._library_scan_worker(targets, self._library_scan_state, pause_while_playing)
+        )
+        return dict(self._library_scan_state)
+
+    async def create_analyzed_playlist(
+        self,
+        name: str = "Smart DJ - analyzed",
+        provider_instance_id: str | None = None,
+        search: str = "",
+        limit: int = 0,
+    ) -> dict[str, Any]:
+        """
+        Create a playlist from every library track that HAS analysis data.
+
+        The result is a ready-to-mix pool: every track in it has the local ML
+        analysis (bpm/key/rms) the Smart DJ optimizer and the smart-fades
+        planner need, so mixing from this playlist always works at full
+        quality. ``search`` narrows the pool to library tracks matching the
+        search string (name/artist/album, same semantics as the MA search).
+        Tracks are scanned in library order (sort_name); ``limit`` caps the
+        scan (0 = up to ``LIBRARY_SCAN_MAX_TRACKS``). The playlist is created
+        on ``provider_instance_id`` when given, else the builtin provider.
+        """
+        cap = (
+            LIBRARY_SCAN_MAX_TRACKS
+            if int(limit) <= 0
+            else max(1, min(int(limit), LIBRARY_SCAN_MAX_TRACKS))
+        )
+        library_tracks = await self.mass.music.tracks.library_items(
+            favorite=None,
+            search=str(search) if search else None,
+            limit=cap,
+            offset=0,
+            order_by="sort_name",
+            summary=False,
+        )
+        uris: list[str] = []
+        scanned = 0
+        for item in library_tracks:
+            item_id = getattr(item, "item_id", None)
+            provider_id = getattr(item, "provider", None)
+            if not item_id or not provider_id:
+                continue
+            scanned += 1
+            existing = await self.mass.streams.audio_analysis.get_audio_analysis(
+                item_id=item_id,
+                provider_instance_id_or_domain=provider_id,
+            )
+            if existing is None:
+                continue
+            uri = getattr(item, "uri", None)
+            if uri:
+                uris.append(uri)
+        if not uris:
+            raise RuntimeError(
+                "No analyzed tracks found - run smart_dj/analyze_library_local first"
+            )
+        playlist = await self.mass.music.playlists.create_playlist(
+            name=name, provider_instance_or_domain=provider_instance_id
+        )
+        # the internal handler runs inline: the action returns once the tracks
+        # are actually in the playlist, not when a background task was queued
+        await self.mass.music.playlists._handle_add_playlist_tracks(playlist.item_id, uris, None)
+        return {
+            "playlist_id": str(playlist.item_id),
+            "name": name,
+            "tracks": len(uris),
+            "scanned": scanned,
+        }
+
+    async def save_sorted_playlist(
+        self,
+        playlist_provider: str,
+        playlist_item_id: str,
+        bpm_tolerance: float = 0.08,
+        prefer_keys: bool = True,
+        preserve_variety: bool = True,
+        mode: str = "ai_dj",
+        controls: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Sort a playlist into Smart DJ order and SAVE the order back.
+
+        The playlist's own track list becomes the sort's persistence: the
+        optimized order is written back through the provider, so every
+        client sees it. Read-only playlists fail loud (the controller's
+        editability + provider-feature checks run inside the handlers).
+        The response carries the new order, per-track energy levels, and
+        per-boundary transition notes.
+        """
+        raw = dict(controls or {})
+        analysis_provider = str(raw.get("analysis_provider", "auto"))
+        control = self._parse_controls(raw, bpm_tolerance, prefer_keys, preserve_variety, mode)
+        playlist_tracks = [
+            item
+            async for item in self.mass.music.playlists.tracks(playlist_item_id, playlist_provider)
+        ]
+        if len(playlist_tracks) < 2:
+            raise RuntimeError("Playlist needs at least 2 tracks to sort")
+        resolved: list[Any] = []
+        for track in playlist_tracks:
+            if getattr(track, "metadata", None) is None and getattr(track, "item_id", None):
+                with suppress(Exception):
+                    track = await self.mass.music.tracks.get(  # noqa: PLW2901
+                        track.item_id, track.provider
+                    )
+            if getattr(track, "item_id", None) and (
+                getattr(track, "provider", None) or getattr(track, "provider_instance", None)
+            ):
+                resolved.append(track)
+        if len(resolved) < 2:
+            raise RuntimeError("Playlist tracks could not be resolved for sorting")
+        analyzed, media_by_id = await _playlist_analysis_rows(self, resolved, analysis_provider)
+        preset = MODES.get(mode, MODES["ai_dj"])
+        selected_mode = DJMode(
+            preset.name,
+            _bpm_tolerance(bpm_tolerance),
+            preset.energy_direction,
+            preset.variety,
+            preset.weights,
+        )
+        optimized = beam_optimize(
+            analyzed[1:],
+            _merge_track(analyzed[0]),
+            selected_mode,
+            controls=control,
+            beam_width=max(4, min(96, control.lookahead * 3)),
+        )
+        ordered = [analyzed[0], *optimized]
+        ordered_media = [media_by_id[entry["queue_item_id"]] for entry in ordered]
+        playlists = self.mass.music.playlists
+        await playlists._handle_remove_playlist_tracks(
+            playlist_item_id, tuple(range(len(ordered_media))), None
+        )
+        await playlists._handle_add_playlist_tracks(
+            playlist_item_id, [media.uri for media in ordered_media], None
+        )
+        levels = [
+            {"name": entry.get("name"), "energy": (entry.get("analysis") or {}).get("energy")}
+            for entry in ordered
+        ]
+        return {
+            "playlist_id": playlist_item_id,
+            "saved": True,
+            "track_count": len(ordered_media),
+            "order": [entry.get("name") for entry in ordered],
+            "levels": levels,
+            "transition_notes": _transition_report(
+                [dict(entry, **(entry.get("analysis") or {})) for entry in ordered], control
+            ),
+        }
 
     def _read_full_queue(self, queue_id: str, page: int = 500) -> list[Any]:
         """
@@ -1272,11 +1780,19 @@ class SmartDJProvider(PluginProvider):
         def signal(name: str, fallback: str = "soft") -> SignalControl:
             value = raw.get(name, fallback)
             if isinstance(value, dict):
-                return SignalControl(
-                    state=str(value.get("state", fallback)),
-                    weight=_signal_weight(value.get("weight", 1.0)),
+                state = str(value.get("state", fallback))
+                weight = _signal_weight(value.get("weight", 1.0))
+            else:
+                state = str(value)
+                weight = 1.0
+            if state not in {"hard", "soft", "disabled"}:
+                # A typo like "hurd" must fail loudly, not silently disable the
+                # signal the user asked for.
+                raise SmartDJError(
+                    "invalid_control",
+                    f"{name}.state={state!r} must be hard, soft, or disabled",
                 )
-            return SignalControl(state=str(value), weight=1.0)
+            return SignalControl(state=state, weight=weight)
 
         transition_bars = _int_control(raw, "transition_bars", 8, allowed={4, 8, 16, 32})
         overrides_raw = raw.get("transition_bars_overrides") or {}
@@ -1300,9 +1816,17 @@ class SmartDJProvider(PluginProvider):
         if key_relation not in {"any", "same", "compatible", "soft"}:
             raise RuntimeError("key_relation must be one of any, same, compatible, soft")
         transition_style = str(raw.get("transition_style", "auto"))
-        if transition_style not in {"auto", "full_blend", "energy", "quick_cut"}:
+        if transition_style not in {
+            "auto",
+            "full_blend",
+            "energy",
+            "quick_cut",
+            "radio",
+            "echo_out",
+            "filter_out",
+        }:
             raise RuntimeError(
-                "transition_style must be one of auto, full_blend, energy, quick_cut"
+                "transition_style must be one of auto, full_blend, energy, quick_cut, radio, echo_out, filter_out"
             )
         beat_strictness = str(raw.get("beat_strictness", "normal"))
         if beat_strictness not in {"strict", "normal", "aggressive"}:
@@ -1329,6 +1853,7 @@ class SmartDJProvider(PluginProvider):
             transition_bars_overrides=overrides,
             automix_enabled=bool(raw.get("automix_enabled", False)),
             smart_reorder_enabled=bool(raw.get("smart_reorder_enabled", True)),
+            stems_enabled=bool(raw.get("stems_enabled", False)),
             transition_style=transition_style,
             beat_strictness=beat_strictness,
             # the FE slider spans 1-96 (beam width = lookahead x 3, capped
@@ -1508,7 +2033,7 @@ class SmartDJProvider(PluginProvider):
                 ):
                     if response.status in (401, 403):
                         body = await response.text()
-                        raise SmartDJError(
+                        raise SmartDJError(  # noqa: TRY301 - the raise IS the error channel
                             "musicae_auth",
                             f"Musicae request failed ({response.status}): {body[:300]}",
                         )
@@ -1520,7 +2045,7 @@ class SmartDJProvider(PluginProvider):
                             retry_after = float(ra)
                     elif response.status >= 400:
                         body = await response.text()
-                        raise RuntimeError(
+                        raise RuntimeError(  # noqa: TRY301 - the raise IS the error channel
                             f"Musicae request failed ({response.status}): {body[:300]}"
                         )
                     else:
@@ -1706,6 +2231,7 @@ class SmartDJProvider(PluginProvider):
             metadata_obj = getattr(media, "metadata", None)
             genres = getattr(metadata_obj, "genres", None) if metadata_obj else None
             genre_list = list(genres or [])
+            image = metadata_obj.images[0] if metadata_obj and metadata_obj.images else None
             result.append(
                 {
                     "queue_item_id": item.queue_item_id,
@@ -1716,6 +2242,138 @@ class SmartDJProvider(PluginProvider):
                     "genre": genre_list[0] if genre_list else None,
                     "genres": list(genres or []),
                     "explicit": getattr(metadata_obj, "explicit", None) if metadata_obj else None,
+                    # first artwork image, serialized for the frontend's
+                    # getMediaItemImageUrl() (album art behind the row)
+                    "image": (
+                        {
+                            "path": image.path,
+                            "proxy_id": image.proxy_id,
+                            "remotely_accessible": image.remotely_accessible,
+                        }
+                        if image
+                        else None
+                    ),
                 }
             )
         return result
+
+    def _any_player_playing(self) -> bool:
+        """Return True when ANY player on this MA instance is actively playing."""
+        return any(
+            player.state.playback_state == PlaybackState.PLAYING for player in self.mass.players
+        )
+
+    def _background_concurrency(self) -> int:
+        """Read the streams background-scan concurrency setting, clamped to 1-8."""
+        try:
+            raw = int(
+                self.mass.config.get_raw_core_config_value(
+                    "streams",
+                    CONF_BACKGROUND_SCAN_CONCURRENCY,
+                    DEFAULT_BACKGROUND_SCAN_CONCURRENCY,
+                )
+                or DEFAULT_BACKGROUND_SCAN_CONCURRENCY
+            )
+        except ValueError, TypeError:
+            raw = DEFAULT_BACKGROUND_SCAN_CONCURRENCY
+        return max(1, min(raw, 8))
+
+    async def _library_scan_worker(
+        self, targets: list[Any], state: dict[str, Any], pause_while_playing: bool
+    ) -> None:
+        """
+        Run the sweep behind the safeguards.
+
+        Every dispatch acquires the concurrency semaphore, then defers while
+        playback is active, then analyzes one track. Cancel and the failure
+        circuit breaker are checked between semaphore acquisitions so nothing
+        half-done is ever left behind (``_analyze_media_silent`` always tears
+        its buffer down in a finally).
+        """
+        sem = asyncio.Semaphore(self._background_concurrency())
+        failures = 0
+
+        async def _one(track: Any) -> None:
+            nonlocal failures
+            async with sem:
+                if failures >= LIBRARY_SCAN_MAX_FAILURES:
+                    state["skipped"] += 1
+                    return
+                while pause_while_playing and not self._library_scan_cancel.is_set():
+                    if self._any_player_playing():
+                        state["deferring"] = True
+                        await asyncio.sleep(LIBRARY_SCAN_POLL_SECONDS)
+                    else:
+                        state["deferring"] = False
+                        break
+                if self._library_scan_cancel.is_set():
+                    state["deferring"] = False
+                    state["skipped"] += 1
+                    return
+                try:
+                    done = await self._analyze_media_silent(track.item_id, track.provider)
+                except Exception as err:
+                    failures += 1
+                    state["failed"] += 1
+                    if len(state["errors"]) < LIBRARY_SCAN_MAX_ERRORS_SHOWN:
+                        state["errors"].append(str(err)[:200])
+                    return
+                if done:
+                    failures = 0
+                    state["analyzed"] += 1
+                else:
+                    state["skipped"] += 1
+
+        try:
+            await asyncio.gather(*(_one(track) for track in targets))
+            if failures >= LIBRARY_SCAN_MAX_FAILURES:
+                state["errors"].append(f"sweep aborted after {failures} consecutive failures")
+        finally:
+            state["running"] = False
+            state["deferring"] = False
+            state["finished_at"] = time.time()
+            self._library_scan_task = None
+            await self._save_cache()
+
+    async def _analyze_media_silent(self, item_id: str, provider_id: str) -> bool:
+        """
+        Silently analyze one media item through the local ML providers.
+
+        Returns True when analysis was newly stored; False when it already
+        existed or the item cannot be analyzed (realtime source, provider gone).
+        """
+        existing = await self.mass.streams.audio_analysis.get_audio_analysis(
+            item_id=item_id,
+            provider_instance_id_or_domain=provider_id,
+        )
+        if existing is not None:
+            return False
+        music_prov = self.mass.get_provider(provider_id, provider_type=MusicProvider)
+        if music_prov is None or not music_prov.available:
+            return False
+        streamdetails = await music_prov.get_stream_details(item_id, MediaType.TRACK)
+        if streamdetails.is_realtime:
+            return False
+        pcm_format = decoded_pcm_format(streamdetails)
+        buffer = AudioBuffer(pcm_format, BufferSize.BALANCED, BufferMode.SEEKABLE)
+        buffer.fill(
+            self.mass.streams.audio.get_media_stream(streamdetails, pcm_format),
+            source_name="smart_dj_background",
+        )
+        try:
+            await self.mass.streams.audio_analysis.start_analysis(buffer, streamdetails)
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + PREROLL_ANALYSIS_TIMEOUT
+            while loop.time() < deadline and not buffer.cancelled and not buffer.eof:
+                await asyncio.sleep(PREROLL_POLL_SECONDS)
+                stored = await self.mass.streams.audio_analysis.get_audio_analysis(
+                    item_id=item_id,
+                    provider_instance_id_or_domain=provider_id,
+                )
+                if stored is not None:
+                    return True
+            return False
+        finally:
+            # tears down the producer and (via the buffer's cancel callback)
+            # evicts any still-active analysis session for this item
+            await buffer.clear()

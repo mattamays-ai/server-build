@@ -12,11 +12,14 @@ from contextlib import aclosing, suppress
 from typing import TYPE_CHECKING
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
+from music_assistant.controllers.streams.constants import VOICE_OVER_RAMP
 from music_assistant.controllers.streams.smart_fades.filters import (
     Filter,
     StreamingCrossfadeFilter,
+    VoiceOverMixFilter,
 )
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
+from music_assistant.controllers.streams.smart_fades import stems as stems_ducking
 from music_assistant.controllers.streams.smart_fades.models import (
     BlendPrefs,
     CrossfadeTimingInfo,
@@ -40,6 +43,7 @@ __all__ = [
     "SmartFade",
     "SmartFadeNotApplicable",
     "StandardCrossFade",
+    "VoiceOverFade",
 ]
 
 
@@ -363,6 +367,7 @@ class StandardCrossFade(SmartFade):
         logger: logging.Logger,
         crossfade_duration: float = 10.0,
         trailing_silence_bytes: int = 0,
+        blend_prefs: BlendPrefs | None = None,
     ) -> None:
         """
         Initialize StandardCrossFade.
@@ -371,10 +376,13 @@ class StandardCrossFade(SmartFade):
         :param crossfade_duration: Length of the crossfade overlap in seconds.
         :param trailing_silence_bytes: Trailing silence in the outgoing tail that
             ``apply()`` slices off before crossfading.
+        :param blend_prefs: Optional Smart DJ blend preferences; when ``stems`` is
+            set the outgoing overlap's vocal content is ducked (smart_fades/stems.py).
         """
         super().__init__(logger)
         self.crossfade_duration = crossfade_duration
         self.trailing_silence_bytes = trailing_silence_bytes
+        self.blend_prefs = blend_prefs
         self.crossfade_size: int = 0
 
     def build(
@@ -449,8 +457,25 @@ class StandardCrossFade(SmartFade):
         split = len(fade_out_part) - crossfade_size
         pre_crossfade = fade_out_part[:split]
         adjusted_fade_out_part = fade_out_part[split:]
+        # Stem ducking (optional, BlendPrefs.stems): separate the overlap region
+        # off-thread NOW so the model runs while the pre-crossfade tail is still
+        # playing out, then swap the ducked bytes in right before the blend. When
+        # the stack is unavailable the bytes come back unchanged.
+        duck_task: asyncio.Task[bytes] | None = None
+        if self.blend_prefs is not None and self.blend_prefs.stems:
+            duck_task = asyncio.get_running_loop().create_task(
+                asyncio.to_thread(
+                    stems_ducking.duck_pcm_bytes,
+                    adjusted_fade_out_part,
+                    pcm_format.sample_rate,
+                    pcm_format.bit_depth,
+                    pcm_format.channels,
+                )
+            )
         for pcm_slice in iter_pcm_slices(pre_crossfade, pcm_format, 1000):
             yield pcm_slice
+        if duck_task is not None:
+            adjusted_fade_out_part = await duck_task
 
         if isinstance(fade_in_part, bytes):
             # aclosing so the mixer ffmpeg tears down here, not from a GC finalizer,
@@ -485,6 +510,116 @@ class StandardCrossFade(SmartFade):
         # is still being read by the mixer's stdin feeder)
         async with aclosing(
             super().apply(adjusted_fade_out_part, _overlap_stream(), pcm_format)
+        ) as blend:
+            async for chunk in blend:
+                yield chunk
+        if overshoot:
+            for pcm_slice in iter_pcm_slices(bytes(overshoot), pcm_format, 1000):
+                yield pcm_slice
+        async for remaining_chunk in fade_in_part:
+            for pcm_slice in iter_pcm_slices(remaining_chunk, pcm_format, 1000):
+                yield pcm_slice
+
+
+class VoiceOverFade(SmartFade):
+    """
+    Play the outgoing item's tail over the start of the incoming track, ducking the track.
+
+    Used for a tail overlap an item declares (a DJ talking over a song's intro): the tail
+    plays as it is, with the track starting under its last ``overlap`` seconds and
+    returning to full level over ``VOICE_OVER_RAMP`` seconds once it has ended.
+    """
+
+    def __init__(self, logger: logging.Logger) -> None:
+        """Initialize VoiceOverFade."""
+        super().__init__(logger)
+        self.overlap_size: int = 0
+        self.blend_in_size: int = 0
+
+    def build(
+        self,
+        fade_out_bytes_len: int,
+        fade_in_bytes_len: int,
+        pcm_format: AudioFormat,
+    ) -> None:
+        """Build the voice over filter chain and assign ``self.timing_info``."""
+        fade_out_seconds = fade_out_bytes_len / pcm_format.pcm_sample_size
+        fade_in_seconds = fade_in_bytes_len / pcm_format.pcm_sample_size
+        overlap = max(0.0, min(fade_out_seconds, fade_in_seconds - VOICE_OVER_RAMP))
+        # whole frames only, so the byte slices in apply match the filter's timing exactly
+        frame_size = (pcm_format.bit_depth // 8) * pcm_format.channels
+        self.overlap_size = int(pcm_format.pcm_sample_size * overlap) // frame_size * frame_size
+        ramp_size = int(pcm_format.pcm_sample_size * VOICE_OVER_RAMP) // frame_size * frame_size
+        self.blend_in_size = self.overlap_size + ramp_size
+        overlap = self.overlap_size / pcm_format.pcm_sample_size
+        self.timing_info = CrossfadeTimingInfo(
+            pre_crossfade_duration=max(0.0, fade_out_seconds - overlap),
+            crossfade_duration=overlap,
+            fadein_trimmed_duration=0.0,
+            post_crossfade_duration=max(0.0, fade_in_seconds - overlap),
+        )
+        self.filters = [
+            VoiceOverMixFilter(
+                logger=self.logger,
+                overlap_seconds=overlap,
+                ramp_seconds=ramp_size / pcm_format.pcm_sample_size,
+            ),
+        ]
+
+    async def apply(
+        self,
+        fade_out_part: bytes,
+        fade_in_part: bytes | AsyncGenerator[bytes],
+        pcm_format: AudioFormat,
+    ) -> AsyncGenerator[bytes]:
+        """
+        Apply the voice over, yielding PCM audio chunks.
+
+        The tail before the overlap plays alone; the incoming track joins for the overlap
+        and the ramp after it, and the rest of the incoming part plays on untouched.
+        """
+        if not self.filters:
+            raise RuntimeError("SmartFade not built — call Mixer.build() first")
+        # the part of the tail before the overlap plays alone, while the incoming
+        # track's audio may still be arriving
+        split = len(fade_out_part) - self.overlap_size
+        for pcm_slice in iter_pcm_slices(fade_out_part[:split], pcm_format, 1000):
+            yield pcm_slice
+        blend_in_size = self.blend_in_size
+
+        if isinstance(fade_in_part, bytes):
+            # aclosing so the mixer ffmpeg tears down here, not from a GC finalizer,
+            # when the consumer aborts mid-blend
+            async with aclosing(
+                super().apply(fade_out_part[split:], fade_in_part[:blend_in_size], pcm_format)
+            ) as blend:
+                async for chunk in blend:
+                    yield chunk
+            for pcm_slice in iter_pcm_slices(fade_in_part[blend_in_size:], pcm_format, 1000):
+                yield pcm_slice
+            return
+
+        # Generator fade-in: hand exactly the blend's share to the mixer as it arrives;
+        # whatever the last chunk carried beyond it opens the plain part
+        overshoot = bytearray()
+
+        async def _blend_in_stream() -> AsyncGenerator[bytes]:
+            taken = 0
+            async for chunk in fade_in_part:
+                remaining = blend_in_size - taken
+                if len(chunk) >= remaining:
+                    taken += remaining
+                    overshoot.extend(chunk[remaining:])
+                    yield chunk[:remaining]
+                    return
+                taken += len(chunk)
+                yield chunk
+
+        # aclosing so the mixer ffmpeg tears down here, not from a GC finalizer, when
+        # the consumer aborts mid-blend (closing this generator while _blend_in_stream
+        # is still being read by the mixer's stdin feeder)
+        async with aclosing(
+            super().apply(fade_out_part[split:], _blend_in_stream(), pcm_format)
         ) as blend:
             async for chunk in blend:
                 yield chunk
