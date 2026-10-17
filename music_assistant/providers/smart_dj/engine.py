@@ -167,7 +167,7 @@ def _coerce_embedding(value: Any) -> list[float] | None:
     if isinstance(value, str) and value:
         try:
             parsed = json.loads(value)
-        except ValueError, TypeError:
+        except (ValueError, TypeError):
             return None
         if isinstance(parsed, list) and parsed:
             return parsed
@@ -199,7 +199,7 @@ def camelot_affinity(a: str | None, b: str | None) -> float:
     try:
         na, nb = int(str(a)[:-1]), int(str(b)[:-1])
         ma, mb = str(a)[-1].upper(), str(b)[-1].upper()
-    except ValueError, TypeError:
+    except (ValueError, TypeError):
         return 0.0
     if ma == mb and ((na - nb) % 12 in (1, 11)):
         return 0.85

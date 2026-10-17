@@ -1401,7 +1401,11 @@ class SmartDJProvider(PluginProvider):
         async def _one(track: Any) -> None:
             async with sem:
                 try:
-                    done = await self._analyze_media_silent(track.item_id, track.provider)
+                    done = False
+                    for a_item_id, a_instance in self._analysis_targets_for_track(track):
+                        if await self._analyze_media_silent(a_item_id, a_instance):
+                            done = True
+                            break
                 except Exception as err:
                     failed[str(track.item_id)] = str(err)
                     return
@@ -1546,11 +1550,16 @@ class SmartDJProvider(PluginProvider):
             if not item_id or not provider_id:
                 continue
             scanned += 1
-            existing = await self.mass.streams.audio_analysis.get_audio_analysis(
-                item_id=item_id,
-                provider_instance_id_or_domain=provider_id,
-            )
-            if existing is None:
+            found = False
+            for a_item_id, a_instance in self._analysis_targets_for_track(item):
+                existing = await self.mass.streams.audio_analysis.get_audio_analysis(
+                    item_id=a_item_id,
+                    provider_instance_id_or_domain=a_instance,
+                )
+                if existing is not None:
+                    found = True
+                    break
+            if not found:
                 continue
             uri = getattr(item, "uri", None)
             if uri:
@@ -2278,6 +2287,32 @@ class SmartDJProvider(PluginProvider):
             raw = DEFAULT_BACKGROUND_SCAN_CONCURRENCY
         return max(1, min(raw, 8))
 
+    @staticmethod
+    def _analysis_targets_for_track(track: Any) -> list[tuple[str, str]]:
+        """
+        Resolve a track to analyzable (provider item_id, provider instance_id) pairs.
+
+        Library items report provider="library" (the library pseudo-provider)
+        with the real source providers in provider_mappings; audio analysis is
+        keyed and read through those provider-native ids, never the library id.
+        Only mappings the provider currently reports as available are returned;
+        non-library items fall back to their own provider fields.
+        """
+        out: list[tuple[str, str]] = []
+        for mapping in getattr(track, "provider_mappings", None) or []:
+            if not getattr(mapping, "available", False):
+                continue
+            item_id = getattr(mapping, "item_id", None)
+            instance_id = getattr(mapping, "provider_instance", None)
+            if item_id and instance_id:
+                out.append((str(item_id), str(instance_id)))
+        if not out:
+            prov = getattr(track, "provider", None)
+            item_id = getattr(track, "item_id", None)
+            if prov and prov != "library" and item_id:
+                out.append((str(item_id), str(prov)))
+        return out
+
     async def _library_scan_worker(
         self, targets: list[Any], state: dict[str, Any], pause_while_playing: bool
     ) -> None:
@@ -2311,7 +2346,11 @@ class SmartDJProvider(PluginProvider):
                     state["skipped"] += 1
                     return
                 try:
-                    done = await self._analyze_media_silent(track.item_id, track.provider)
+                    done = False
+                    for a_item_id, a_instance in self._analysis_targets_for_track(track):
+                        if await self._analyze_media_silent(a_item_id, a_instance):
+                            done = True
+                            break
                 except Exception as err:
                     failures += 1
                     state["failed"] += 1

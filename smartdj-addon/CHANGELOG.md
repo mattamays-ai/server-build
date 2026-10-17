@@ -2,6 +2,15 @@
 
 All notable changes to the Smart DJ Music Assistant add-on.
 
+## 0.0.26
+
+- **Fixed: library sweep and analyzed-playlist never worked** — library
+  tracks report `provider: "library"` (the library pseudo-provider), so the
+  sweep, per-playlist silent analysis, and create-analyzed-playlist all
+  resolved no music provider and skipped every track instantly. All three
+  now resolve each track's real provider through its provider mappings and
+  key/read audio analysis by the provider-native item id.
+
 ## 0.0.25
 
 - **Stems vocal duck** — on the fallback crossfade, the outgoing track's vocal
