@@ -647,6 +647,10 @@ class StreamsAudio:
         # pinned by the Smart DJ provider alongside the duration pins
         self._automix_blend_prefs: dict[str, tuple[str, str]] = {}
         self._automix_stems_enabled: bool = False
+        # per-queue-item stems vetoes (queue_item_id -> reason) pinned by the
+        # Smart DJ provider: the blend INTO a vetoed item runs dry even with
+        # the global stems toggle on (0.0.28 lane D)
+        self._automix_stems_vetoes: dict[str, str] = {}
         self._smart_fades_mixer: SmartFadesMixer | None = None
         # serializes buffer preparation per queue item, so concurrent callers share
         # the single source (and the single capacity reselection) instead of racing
@@ -1980,6 +1984,20 @@ class StreamsAudio:
         the fade layer degrades to the plain blend otherwise.
         """
         self._automix_stems_enabled = bool(enabled)
+
+    def set_automix_stems_vetoes(self, vetoes: dict[str, str]) -> None:
+        """
+        Pin per-queue-item stems vetoes (queue_item_id -> reason), set by Smart DJ.
+
+        The blend INTO a pinned item runs dry (no stem processing) even with
+        the global stems toggle on: plan-time analysis judged separation
+        likely to hurt that particular transition (0.0.28 lane D). Replaces
+        the whole map; pin an empty map to release (an AutoMix-off apply does
+        exactly that).
+        """
+        self._automix_stems_vetoes = {
+            str(item_id): str(reason) for item_id, reason in vetoes.items()
+        }
 
     async def get_queue_item_stream_with_smartfade(  # noqa: C901, PLR0912
         self,
@@ -3568,7 +3586,9 @@ class StreamsAudio:
             preferred_tier=preferred,
             max_stretch_pct=stretch_pct,
             style_override=style_override,
-            stems=self._automix_stems_enabled,
+            stems=(
+                self._automix_stems_enabled and str(queue_item_id) not in self._automix_stems_vetoes
+            ),
         )
 
     def _notify_provider_stream_started(self, streamdetails: StreamDetails) -> bool:

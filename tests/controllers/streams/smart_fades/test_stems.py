@@ -50,7 +50,7 @@ def test_pcm16_encode_known_bytes() -> None:
 
 
 def test_pcm16_roundtrip_within_1_lsb() -> None:
-    """bytes -> float -> bytes stays within one LSB over a large random sample."""
+    """Bytes -> float -> bytes stays within one LSB over a large random sample."""
     values = RNG.integers(-32768, 32768, size=100000, dtype=np.int32)
     pcm = values.astype("<i2").tobytes()
     out = pcm_bytes_to_numpy(pcm, 44100, 16, 2)
@@ -140,7 +140,7 @@ def test_resample_44100_to_48000_length() -> None:
 
 
 def test_resample_zero_stays_zero() -> None:
-    n_out = max(1, int(round(1000 * 48000 / 44100)))
+    n_out = max(1, round(1000 * 48000 / 44100))
     out = resample_linear(np.zeros((2, 1000), dtype=np.float32), 44100, 48000)
     assert out.shape == (2, n_out)
     assert np.array_equal(out, np.zeros_like(out))
@@ -203,3 +203,36 @@ def test_get_mask_shape_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     assert mask.dtype == np.float32
     assert mask.min() >= 0.0
     assert mask.max() <= 1.0
+
+# --- per-transition veto floor (0.0.28 lane D) -----------------------------------
+
+
+class _FakeSeparator:
+    """Stand-in for StemSeparator that returns a canned bounded mask."""
+
+    def __init__(self, mask: np.ndarray) -> None:
+        self._mask = mask
+
+    def cached_mask(
+        self, item_id: str, provider: str, sample_rate: int, mix: np.ndarray
+    ) -> np.ndarray:
+        """Return the canned mask (signature matches StemSeparator.cached_mask)."""
+        return self._mask
+
+
+def test_duck_pcm_bytes_runs_dry_on_an_empty_mask(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A mask under MIN_DUCK_MASK_ENERGY means an inaudible duck: run dry."""
+    pcm = RNG.integers(-20000, 20000, size=4800).astype("<i2").tobytes()
+    tiny = np.full((2, 1024), 0.001, dtype=np.float32)
+    monkeypatch.setattr(stems, "_SHARED_SEPARATOR", _FakeSeparator(tiny))
+    assert duck_pcm_bytes(pcm, 48000, 16, 2) == pcm
+
+
+def test_duck_pcm_bytes_still_ducks_on_a_substantial_mask(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Above the veto floor the duck math still applies to the overlap."""
+    pcm = RNG.integers(-20000, 20000, size=4800).astype("<i2").tobytes()
+    substantial = np.full((2, 1024), 0.9, dtype=np.float32)
+    monkeypatch.setattr(stems, "_SHARED_SEPARATOR", _FakeSeparator(substantial))
+    assert duck_pcm_bytes(pcm, 48000, 16, 2) != pcm

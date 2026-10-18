@@ -574,27 +574,83 @@ async def test_pull_candidates_without_init() -> None:
         await prov.pull_candidates()
 
 
-def test_pull_candidates_is_registered(tmp_path: Any) -> None:
-    """loaded_in_mass registers smart_dj/pull_candidates as an API command."""
+def _registration_prov(tmp_path: Any) -> tuple[Any, list[str], list[Any]]:
+    """
+    Build a bare provider whose mass stub records api commands + subscriptions.
+
+    The stub must mirror EVERY mass member loaded_in_mass touches: a future
+    addition (e.g. lane B's subscribe) missing here fails LOUD with
+    AttributeError - which is exactly how a stale copy of this test failed
+    the lane D gate while HEAD was already green.
+    """
     prov = _bare_prov(tmp_path)
     registered: list[str] = []
+    subscribed: list[Any] = []
+
+    def _register(cmd: str, _handler: Any, **_kwargs: Any) -> None:
+        registered.append(cmd)
+
+    def _subscribe(*_a: Any, **_k: Any) -> Any:
+        subscribed.append(_a)
+        return lambda: None
+
     prov.mass = cast(
         "Any",
         SimpleNamespace(
             storage_path=str(tmp_path),
-            register_api_command=lambda cmd, _handler, **_kwargs: registered.append(cmd),
+            register_api_command=_register,
             create_task=lambda coro: (coro.close(), None)[1],
+            # lane B: loaded_in_mass also subscribes the pre-analysis listener
+            subscribe=_subscribe,
         ),
     )
     prov._handles = []
+    return prov, registered, subscribed
 
-    async def _noop() -> None:
-        return None
 
-    prov._load_cache = _noop  # type: ignore[method-assign]
-    prov._setup_ui = lambda: None  # type: ignore[method-assign]
-    asyncio.run(prov.loaded_in_mass())
+async def _noop() -> None:
+    return None
+
+
+async def _run_loaded_in_mass(prov: Any) -> None:
+    prov._load_cache = _noop
+    prov._setup_ui = lambda: None
+    await prov.loaded_in_mass()
+
+
+def test_pull_candidates_is_registered(tmp_path: Any) -> None:
+    """loaded_in_mass registers the FULL Smart DJ command set + the listener."""
+    prov, registered, subscribed = _registration_prov(tmp_path)
+    asyncio.run(_run_loaded_in_mass(prov))
+    # every command loaded_in_mass registers - a silently drifting stub (the
+    # phantom "battery still fails at HEAD" class of report) cannot hide here
+    assert set(registered) == {
+        "smart_dj/analyze",
+        "smart_dj/rank_queue",
+        "smart_dj/mix_playlist",
+        "smart_dj/mix_tracks",
+        "smart_dj/save_sorted_playlist",
+        "smart_dj/status",
+        "smart_dj/capabilities",
+        "smart_dj/preroll_queue_analysis",
+        "smart_dj/complete_mix",
+        "smart_dj/analyze_library",
+        "smart_dj/analyze_playlist",
+        "smart_dj/analyze_library_local",
+        "smart_dj/create_analyzed_playlist",
+        "smart_dj/pull_candidates",
+    }
     assert "smart_dj/pull_candidates" in registered
+    # exactly one subscription: the MEDIA_ITEM_ADDED pre-analysis listener
+    assert len(subscribed) == 1
+
+
+def test_registration_stub_missing_subscribe_fails_loud(tmp_path: Any) -> None:
+    """Negative control: a mass stub without subscribe raises AttributeError."""
+    prov, _registered, _subscribed = _registration_prov(tmp_path)
+    del prov.mass.subscribe
+    with pytest.raises(AttributeError, match="subscribe"):
+        asyncio.run(_run_loaded_in_mass(prov))
 
 
 def test_pool_source_documented_in_controls_path() -> None:

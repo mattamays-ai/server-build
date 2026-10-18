@@ -27,8 +27,8 @@ import logging
 import time
 import urllib.request
 from dataclasses import dataclass
-from pathlib import Path
 from importlib import import_module
+from pathlib import Path
 from types import ModuleType
 
 import numpy as np
@@ -58,6 +58,13 @@ MODEL_SIZE_BYTES = 66_759_214  # 66.8 MB measured; earlier "30-60MB" estimate wa
 
 # Duck depth applied to the outgoing vocal during a fully vocal overlap.
 DEFAULT_DUCK_DB = -6.0
+# Per-transition veto floor (0.0.28 lane D): duck_db_for_mask scales the duck
+# by mean mask energy, so a mask this quiet turns the nominal -6 dB depth into
+# an inaudible fraction of a dB - separation found no trustworthy vocal to
+# remove and the overlap runs dry instead of paying ~2.3x overlap CPU for
+# nothing. Aligned with the smart-dj quick-pull index's instrumental line
+# (VOCAL_DENSITY_INSTRUMENTAL = 0.02).
+MIN_DUCK_MASK_ENERGY: float = 0.02
 # Bounded mask cache: separation is expensive, but a player could crossfade
 # through many tracks per session, so never let this grow without a cap.
 MASK_CACHE_MAX = 8
@@ -99,7 +106,7 @@ def ensure_model() -> bool:
             return False
         staging.replace(MODEL_FILE)
         return True
-    except Exception as err:  # noqa: BLE001 - any fetch failure just means "off"
+    except Exception as err:
         LOGGER.warning("Stem model download failed: %s", err)
         return False
 
@@ -248,7 +255,7 @@ class StemSeparator:
             self._session = ort.InferenceSession(
                 str(MODEL_FILE), options, providers=["CPUExecutionProvider"]
             )
-        except Exception as err:  # noqa: BLE001 - any load failure means "off"
+        except Exception as err:
             self.logger.warning("Stem model failed to load: %s", err)
             return None
         return self._session
@@ -433,9 +440,15 @@ def duck_pcm_bytes(
         mix44 = resample_linear(mix, sample_rate, SAMPLE_RATE)
         # content-hash cache key (with the stream rate: identical bytes at
         # different rates resample to different masks, so they must not share)
-        key = hashlib.sha1(pcm).hexdigest()[:16] + f"@{sample_rate}"  # noqa: S324
+        key = hashlib.sha1(pcm).hexdigest()[:16] + f"@{sample_rate}"
         mask = separator.cached_mask(key, "pcm", SAMPLE_RATE, mix44)
         if mask is None:
+            return pcm
+        # Per-transition veto (0.0.28 lane D): separation confidence too low to
+        # matter. duck_db_for_mask scales the duck by mean mask energy, so a
+        # near-empty mask means an inaudible duck - run the overlap dry.
+        if float(np.clip(float(mask.mean()), 0.0, 1.0)) < MIN_DUCK_MASK_ENERGY:
+            LOGGER.debug("Stem duck vetoed: mask energy under %s", MIN_DUCK_MASK_ENERGY)
             return pcm
         spec = np.fft.rfft(mix44, axis=1)
         bins = min(spec.shape[1], mask.shape[1])
@@ -448,7 +461,7 @@ def duck_pcm_bytes(
             delta = np.pad(delta, ((0, 0), (0, mix.shape[1] - delta.shape[1])))
         out = mix - delta[:, : mix.shape[1]]
         encoded = numpy_to_pcm_bytes(out.astype(np.float32), bit_depth, channels)
-    except Exception:  # noqa: BLE001 - a duck must never break a transition
+    except Exception:
         LOGGER.exception("Stem duck failed; falling back to the unducked overlap")
         return pcm
     if encoded is None or len(encoded) != len(pcm):

@@ -9,6 +9,7 @@ import os
 import re
 import tempfile
 import time
+from collections import deque
 from contextlib import suppress
 from itertools import pairwise
 from pathlib import Path
@@ -20,6 +21,7 @@ from music_assistant_models.auth import Scope
 from music_assistant_models.config_entries import ConfigEntry
 from music_assistant_models.enums import (
     ConfigEntryType,
+    EventType,
     ExternalID,
     MediaType,
     PlaybackState,
@@ -34,6 +36,7 @@ from music_assistant.controllers.player_queues.helpers import build_queue_item
 from music_assistant.controllers.streams.audio_analysis import SONIC_ANALYSIS_DOMAIN
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.controllers.streams.constants import BufferMode, BufferSize
+from music_assistant.controllers.streams.smart_fades import stems as stems_ducking
 from music_assistant.helpers.app_vars import app_var
 from music_assistant.helpers.audio import decoded_pcm_format
 from music_assistant.models.music_provider import MusicProvider
@@ -41,6 +44,8 @@ from music_assistant.models.plugin import PluginProvider
 
 from . import quick_index
 from .engine import (
+    ARC_CLIMB_MAX,
+    ARC_RESET_DROP,
     MODES,
     DJControls,
     DJMode,
@@ -54,6 +59,7 @@ from .quick_index import (
     ENERGY_BANDS,
     INDEX_FILENAME,
     INDEX_VERSION,
+    VOCAL_DENSE_DENSITY,
     VOCAL_TIER_NAMES,
     QuickIndex,
     analysis_from_index_row,
@@ -63,11 +69,16 @@ from .quick_index import (
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ProviderConfig
+    from music_assistant_models.event import MassEvent
     from music_assistant_models.provider import ProviderManifest
 
     from music_assistant.mass import MusicAssistant
 
 CONF_RAPIDAPI_KEY = "rapidapi_key"
+# Pre-analysis on arrival (0.0.28 lane B): toggle for analyzing newly
+# added library tracks in the background (writer in get_config_entries,
+# reader in _preanalysis_enabled - shipped as a pair).
+CONF_PREANALYSIS_ENABLED = "preanalysis_enabled"
 MUSICAE_HOST = "dj-track-audio-analysis-api.p.rapidapi.com"
 MUSICAE_BASE = f"https://{MUSICAE_HOST}"
 CACHE_TTL = 86400.0
@@ -96,16 +107,52 @@ LIBRARY_SCAN_POLL_SECONDS = 10.0
 LIBRARY_SCAN_MAX_FAILURES = 50
 LIBRARY_SCAN_MAX_ERRORS_SHOWN = 5
 
+# Hard ceiling for ONE sweep attempt (streamdetails fetch + buffer fill +
+# analysis wait). The analyzer's own PREROLL_ANALYSIS_TIMEOUT is 600s - far too
+# slow for a sweep: a hung producer must not stall a track slot for 10 minutes.
+# Cancellation is safe: _analyze_media_silent's finally always runs
+# buffer.clear(), which cancels the producer and (via the buffer's registered
+# cancel callback) evicts the still-active analysis session.
+ANALYSIS_ATTEMPT_TIMEOUT = 45
 
-def _automix_durations(tracks: list[dict[str, Any]], control: DJControls) -> dict[str, float]:
+# Pre-analysis on arrival (0.0.28 lane B): the pending queue is BOUNDED - when
+# full, the oldest pending track is dropped (logged) so a burst of additions
+# can never grow memory without limit. Bulk provider syncs do not emit
+# per-item events (SUPPRESS_MEDIA_ITEM_UPDATES), so the queue only ever sees
+# genuinely new, individually added tracks.
+PREANALYSIS_QUEUE_MAX = 50
+
+
+def _sweep_track_name(track: Any) -> str:
+    """Best-effort display name for a sweep failure row."""
+    return str(getattr(track, "name", None) or getattr(track, "item_id", None) or "unknown track")
+
+
+def _record_sweep_failure(state: dict[str, Any], item_id: str, name: str, reason: str) -> None:
+    """Record one sweep failure honestly: capped errors list + last-10 rows."""
+    if len(state["errors"]) < LIBRARY_SCAN_MAX_ERRORS_SHOWN:
+        state["errors"].append(f"{reason}: {item_id} ({name})"[:200])
+    rows: list[dict[str, str]] = state["recent_failures"]
+    rows.append({"item_id": str(item_id), "name": str(name), "reason": str(reason)[:200]})
+    del rows[:-10]
+
+
+def _automix_durations(
+    tracks: list[dict[str, Any]],
+    control: DJControls,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, float]:
     """
     Derive per-track crossfade lengths (seconds) from the plan's transition bars.
 
-    The transition INTO a track lasts as long as that track's bars (per-track
-    override first, then the global setting) at the track's own tempo. Tracks
-    without usable bpm get no pin and keep the engine's default length.
+    The transition INTO a track lasts as long as that track's bars: per-track
+    override first, then the DERIVED per-transition count (0.0.28 lane C,
+    with ``previous`` as the first track's outgoing predecessor), then the
+    global setting - at the track's own tempo. Tracks without usable bpm get
+    no pin and keep the engine's default length.
     """
     durations: dict[str, float] = {}
+    outgoing = previous
     for track in tracks:
         analysis = track.get("analysis") or {}
         raw_bpm = analysis.get("bpm") or track.get("bpm")
@@ -117,10 +164,14 @@ def _automix_durations(tracks: list[dict[str, Any]], control: DJControls) -> dic
             continue
         if bpm <= 0:
             continue
-        bars = (
-            control.transition_bars_overrides.get(str(track.get("queue_item_id")))
-            or control.transition_bars
-        )
+        override = control.transition_bars_overrides.get(str(track.get("queue_item_id")))
+        if override is not None:
+            # the historical ``or``-fallback semantics for a 0 (hard cut)
+            # override are preserved: a 0.0s pin is not a supported blend
+            bars = override or control.transition_bars
+        else:
+            bars = derive_transition_bars(outgoing, track, control)[0]
+        outgoing = track
         try:
             beats_per_bar = int(analysis.get("beats_per_bar") or 4)
         except TypeError, ValueError:
@@ -189,6 +240,19 @@ RULE_DOUBLE_DROP_NON_DNB = "double_drop_non_dnb"
 RULE_BACKSPIN_NEVER_AUTO = "backspin_never_auto"
 RULE_TRANSITION_BARS_CAPPED = "transition_bars_capped"
 
+# Per-transition stems veto reasons (0.0.28 lane D). Stable snake_case ids the
+# FE reads from the mix response's per-transition metadata
+# ("stems_veto_reason"); they are API surface, never rename them.
+STEMS_VETO_DISABLED = "stems_disabled"
+STEMS_VETO_UNAVAILABLE = "stems_unavailable"
+STEMS_VETO_OUTGOING_INSTRUMENTAL = "outgoing_instrumental"
+STEMS_VETO_OUTGOING_VOCAL_DOMINANCE = "outgoing_vocal_dominance"
+# Plan-time proxy for the planner's near-instrumental line
+# (_INSTRUMENTAL_DUTY_MAX = 0.05 in smart_fades/planner/candidates.py): an
+# outgoing deck under this mean vocal-duty density has nothing a DEFAULT_DUCK_DB
+# (-6 dB, smart_fades/stems.py) duck could audibly remove.
+STEMS_VETO_INSTRUMENTAL_DENSITY: float = 0.05
+
 # Pair-level genre families for the auto-choice rules (research verdicts,
 # 0.0.27): quick_cut is the natural default in hip-hop/pop/rock/funk but must
 # never be an AUTO choice over four-on-the-floor material; double-drop is
@@ -204,6 +268,23 @@ FOUR_ON_FLOOR_GENRES: tuple[str, ...] = (
 )
 DNB_GENRES: tuple[str, ...] = ("drum and bass", "drum & bass", "jungle")
 
+# Vocal-dense / radio-material genre family (pop, hip-hop, rock, ...): the
+# third PAIR_BAR_CEILINGS family, hoisted to a name so the lane C phrase-math
+# candidates share the exact same keyword list (one authority, two readers).
+RADIO_GENRES: tuple[str, ...] = (
+    "pop",
+    "hip hop",
+    "hip-hop",
+    "rap",
+    "rock",
+    "punk",
+    "metal",
+    "indie",
+    "folk",
+    "soul",
+    "funk",
+)
+
 # transition_bars stays a global control, but a pair's genre may clamp it
 # (research: house/techno/trance run 32-bar blends, DnB tops out at 8,
 # pop/hip-hop/rock/funk live at 4-8 with 16 as the hard cap). The clamp is
@@ -212,22 +293,30 @@ DNB_GENRES: tuple[str, ...] = ("drum and bass", "drum & bass", "jungle")
 PAIR_BAR_CEILINGS: tuple[tuple[tuple[str, ...], int], ...] = (
     (FOUR_ON_FLOOR_GENRES, 32),
     (DNB_GENRES, 8),
-    (
-        (
-            "pop",
-            "hip hop",
-            "hip-hop",
-            "rap",
-            "rock",
-            "punk",
-            "metal",
-            "indie",
-            "folk",
-            "soul",
-            "funk",
-        ),
-        16,
-    ),
+    (RADIO_GENRES, 16),
+)
+
+# Per-transition derived-bar reason ids (0.0.28 lane C). Stable snake_case
+# values the FE reads from the mix response's per-transition metadata
+# ("transition_bars_reason"); they are API surface, never rename them.
+TRANSITION_BARS_REASON_GLOBAL = "global_setting"
+TRANSITION_BARS_REASON_FAMILY = "genre_family_phrase_math"
+TRANSITION_BARS_REASON_CLIMB = "arc_climb_long_build"
+TRANSITION_BARS_REASON_RESET = "arc_reset_short"
+TRANSITION_BARS_REASON_VOCAL = "vocal_pair_short"
+TRANSITION_BARS_REASON_OVERRIDE = "user_override"
+
+# Phrase-math candidates per genre family (0.0.28 lane C): (short, long) are
+# the family's clean phrase lengths, verified against the engine/planner
+# usage sites and the PAIR_BAR_CEILINGS research verdicts - house/techno/
+# trance run 32-bar blends (the long stop), DnB tops out at 8 (the build
+# spec's raw {16, 32} would breach that verified ceiling and is NOT shipped),
+# and pop/hip-hop/rock material lives at 4-8 with 16 as the hard cap. A pair
+# spanning families takes the STRICTEST combination (min of both stops).
+BAR_FAMILY_CANDIDATES: tuple[tuple[tuple[str, ...], tuple[int, int]], ...] = (
+    (FOUR_ON_FLOOR_GENRES, (8, 32)),
+    (DNB_GENRES, (4, 8)),
+    (RADIO_GENRES, (4, 8)),
 )
 
 
@@ -253,6 +342,89 @@ def _pair_bar_cap(outgoing: dict[str, Any] | None, incoming: dict[str, Any]) -> 
                 caps.append(ceiling)
                 break
     return min(caps) if caps else None
+
+
+def _bar_family_candidates(
+    outgoing: dict[str, Any] | None, incoming: dict[str, Any]
+) -> tuple[int, int] | None:
+    """
+    Return the strictest (short, long) phrase-math candidates for a pair.
+
+    Either side's genre may match a family; a pair spanning families takes
+    the min of both stops so the boundary satisfies both phrase maths.
+    Returns None when neither side matches a profiled family - the user's
+    global bars then pass through untouched.
+    """
+    genres = (_genre_of(outgoing), _genre_of(incoming))
+    matched = [
+        candidates
+        for keywords, candidates in BAR_FAMILY_CANDIDATES
+        if any(any(keyword in genre for keyword in keywords) for genre in genres if genre)
+    ]
+    if not matched:
+        return None
+    return (min(lo for lo, _ in matched), min(hi for _, hi in matched))
+
+
+def _energy_of(track: dict[str, Any] | None) -> float | None:
+    """Finite numeric energy of a track row (nested analysis loses to top level)."""
+    if not track:
+        return None
+    merged = {**(track.get("analysis") or {}), **track}
+    energy = merged.get("energy")
+    if isinstance(energy, bool) or not isinstance(energy, (int, float)):
+        return None
+    value = float(energy)
+    return value if math.isfinite(value) else None
+
+
+def derive_transition_bars(
+    outgoing: dict[str, Any] | None,
+    incoming: dict[str, Any],
+    control: DJControls,
+) -> tuple[int, str]:
+    """
+    Derive the effective transition bar count for ONE boundary (0.0.28 lane C).
+
+    Deterministic plan-time decision from data the planner already has - the
+    flat global constant is only the BASE now: the pair's genre-family phrase
+    math bounds it, the energy-arc position picks the family's long stop on a
+    climb (longer builds) and the short stop on a reset (resets stay short),
+    and a KNOWN vocal-vs-vocal boundary always falls back to the short stop
+    (vocal material gets the short/safe handover even mid-climb). The user's
+    per-track ``transition_bars_overrides`` are applied by the callers and
+    always win over this derivation. Returns (bars, reason) with a stable
+    snake_case reason id for the mix response metadata.
+    """
+    bars = control.transition_bars
+    reason = TRANSITION_BARS_REASON_GLOBAL
+    family = _bar_family_candidates(outgoing, incoming)
+    if family is None:
+        return bars, reason
+    short, long = family
+    clamped = max(short, min(bars, long))
+    if clamped != bars:
+        bars = clamped
+        reason = TRANSITION_BARS_REASON_FAMILY
+    cur_e = _energy_of(outgoing)
+    cand_e = _energy_of(incoming)
+    if cur_e is not None and cand_e is not None:
+        delta = cand_e - cur_e
+        if delta <= -ARC_RESET_DROP:
+            bars = short
+            reason = TRANSITION_BARS_REASON_RESET
+        elif delta >= ARC_CLIMB_MAX:
+            bars = long
+            reason = TRANSITION_BARS_REASON_CLIMB
+    # a KNOWN vocal-vs-vocal boundary (instrumental is False on both sides,
+    # the same merged-row convention _transition_report uses) stays short:
+    # unknown vocal status must not shorten a blend, a known one must.
+    cur = {**(outgoing.get("analysis") or {}), **outgoing} if outgoing else {}
+    cand = {**(incoming.get("analysis") or {}), **incoming}
+    if cur.get("instrumental") is False and cand.get("instrumental") is False and bars > short:
+        bars = short
+        reason = TRANSITION_BARS_REASON_VOCAL
+    return bars, reason
 
 
 def _style_guard(
@@ -323,10 +495,15 @@ def _pair_style(
             rules.extend(blocked)
             fallback = incoming_profile or outgoing_profile
             style = fallback[0] if fallback else "full_blend"
-    bars = control.transition_bars
+    bars, bars_reason = derive_transition_bars(outgoing, incoming, control)
     cap = _pair_bar_cap(outgoing, incoming)
     if cap is not None and bars > cap:
         bars = cap
+        rules.append(RULE_TRANSITION_BARS_CAPPED)
+    elif bars_reason == TRANSITION_BARS_REASON_FAMILY:
+        # the family phrase math lowered the user's base: same honest
+        # "genre shortened your bars" signal as the cap, so the FE's
+        # existing rule definition renders for it too
         rules.append(RULE_TRANSITION_BARS_CAPPED)
     return {
         "style": style,
@@ -334,7 +511,57 @@ def _pair_style(
         "source": source,
         "rules": rules,
         "bars": bars,
+        "bars_reason": bars_reason,
     }
+
+
+def _stems_veto_reason(
+    outgoing: dict[str, Any] | None,
+    stems_enabled: bool,
+) -> str | None:
+    """
+    Decide whether the stems vocal-duck may run for one transition.
+
+    Per-transition veto (0.0.28 lane D): the overlap runs DRY (no stem
+    processing) when separation is likely to hurt or helplessly noop, and the
+    reason travels to the FE via the mix response's per-transition metadata.
+    The thresholds are derived, not invented:
+
+    - nothing to duck: the outgoing deck's mean vocal density sits under the
+      planner's near-instrumental duty line (STEMS_VETO_INSTRUMENTAL_DENSITY,
+      mirroring candidates._INSTRUMENTAL_DUTY_MAX), or the analysis flat-out
+      claims instrumental - stems.duck_db_for_mask would scale the -6 dB depth
+      to ~0 dB of actual duck, so processing is pure cost;
+    - outgoing vocal dominance: the outgoing deck is at or past the index's
+      vocal tier-2 line (quick_index.VOCAL_DENSE_DENSITY) - the duck is capped
+      at stems.DEFAULT_DUCK_DB (-6 dB), so a dominant vocal stays
+      half-suppressed over the incoming deck and the spectral gate leaves
+      artifacts behind;
+    - separation stack unavailable: no runtime/model, the duck could never
+      apply (stems.available());
+
+    and when the user's stems toggle is OFF the veto is reported as
+    ``stems_disabled`` (default behavior: stems only run when toggled on).
+    Returns None when the duck should run.
+    """
+    if not stems_enabled:
+        return STEMS_VETO_DISABLED
+    if not stems_ducking.available():
+        return STEMS_VETO_UNAVAILABLE
+    if outgoing is None:
+        return None
+    # callers feed either nested rows ({"analysis": {...}}) or flat dicts;
+    # analysis keys lose to the top level, same as _transition_report
+    cur = {**(outgoing.get("analysis") or {}), **outgoing}
+    density = cur.get("vocal_density")
+    if isinstance(density, (int, float)) and not isinstance(density, bool):
+        if density < STEMS_VETO_INSTRUMENTAL_DENSITY:
+            return STEMS_VETO_OUTGOING_INSTRUMENTAL
+        if density >= VOCAL_DENSE_DENSITY:
+            return STEMS_VETO_OUTGOING_VOCAL_DOMINANCE
+    elif cur.get("instrumental") is True:
+        return STEMS_VETO_OUTGOING_INSTRUMENTAL
+    return None
 
 
 def _transition_report(
@@ -366,6 +593,14 @@ def _transition_report(
         camelot_a, camelot_b = cur.get("camelot"), cand.get("camelot")
         key_distance = camelot_affinity(camelot_a, camelot_b) if camelot_a and camelot_b else None
         resolved = _pair_style(cur, cand, control)
+        veto = _stems_veto_reason(current, control.stems_enabled)
+        # the user's per-track override (0 = hard cut) always wins over the
+        # derivation (0.0.28 lane C contract)
+        override = control.transition_bars_overrides.get(str(cand.get("queue_item_id")))
+        if override is not None:
+            bars, bars_reason = override, TRANSITION_BARS_REASON_OVERRIDE
+        else:
+            bars, bars_reason = resolved["bars"], resolved["bars_reason"]
         notes.append(
             {
                 "to": cand.get("name"),
@@ -379,8 +614,16 @@ def _transition_report(
                 # stable snake_case rule ids for the FE's plain-language
                 # definitions (server half of the definitions contract)
                 "rules": resolved["rules"],
-                # the pair's genre-clamped effective transition length
-                "transition_bars": resolved["bars"],
+                # the pair's derived effective transition length (lane C)
+                # -- or the user's per-track override, which always wins
+                "transition_bars": bars,
+                # stable snake_case reason id for the derived value
+                "transition_bars_reason": bars_reason,
+                # per-transition stems veto (0.0.28 lane D): when separation is
+                # likely to hurt (or would noop) the overlap runs dry and the
+                # reason rides along; a null reason means the duck ran
+                "stems_used": veto is None,
+                "stems_veto_reason": veto,
             }
         )
     return notes
@@ -412,6 +655,31 @@ def _automix_blend_prefs(
         prefs[str(track["queue_item_id"])] = (resolved["style"], resolved["strictness"])
         outgoing = track
     return prefs
+
+
+def _automix_stems_vetoes(
+    tracks: list[dict[str, Any]],
+    control: DJControls,
+    previous: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    """
+    Pin per-transition stems vetoes for AutoMix, same keys as the blend prefs.
+
+    The blend INTO each track reads its own veto, computed against that
+    track's OUTGOING predecessor (same walk as _automix_blend_prefs).
+    "stems_disabled" is deliberately omitted: with the user's toggle off the
+    global stems pin already keeps every overlap dry.
+    """
+    vetoes: dict[str, str] = {}
+    outgoing = previous
+    for track in tracks:
+        if track.get("queue_item_id") is None:
+            continue
+        reason = _stems_veto_reason(outgoing, control.stems_enabled)
+        if reason is not None and reason != STEMS_VETO_DISABLED:
+            vetoes[str(track["queue_item_id"])] = reason
+        outgoing = track
+    return vetoes
 
 
 def _camelot_from_key(key: str | None, mode: str | None) -> str | None:
@@ -1159,10 +1427,13 @@ class SmartDJProvider(PluginProvider):
                 # reorder is requested.
                 self.mass.player_queues.set_crossfade(queue_id, True)
                 self.mass.streams.audio.set_automix_durations(
-                    _automix_durations(tracks[1:], control)
+                    _automix_durations(tracks[1:], control, previous=tracks[0])
                 )
                 self.mass.streams.audio.set_automix_blend_prefs(
                     _automix_blend_prefs(tracks[1:], control, previous=tracks[0])
+                )
+                self.mass.streams.audio.set_automix_stems_vetoes(
+                    _automix_stems_vetoes(tracks[1:], control, previous=tracks[0])
                 )
                 self.mass.streams.audio.set_automix_stems(control.stems_enabled)
                 self.mass.create_task(self.preroll_queue_analysis(queue_id, 10))
@@ -1250,6 +1521,7 @@ class SmartDJProvider(PluginProvider):
                 # automix off in this plan: release any previously pinned lengths
                 self.mass.streams.audio.set_automix_durations({})
                 self.mass.streams.audio.set_automix_blend_prefs({})
+                self.mass.streams.audio.set_automix_stems_vetoes({})
                 self.mass.streams.audio.set_automix_stems(False)
             if control.automix_enabled:
                 # Real AutoMix execution: hand the queue to the streams engine's
@@ -1257,10 +1529,13 @@ class SmartDJProvider(PluginProvider):
                 # otherwise). A plan with automix disabled never touches the toggle.
                 self.mass.player_queues.set_crossfade(queue_id, True)
                 self.mass.streams.audio.set_automix_durations(
-                    _automix_durations(optimized, control)
+                    _automix_durations(optimized, control, previous=tracks[0])
                 )
                 self.mass.streams.audio.set_automix_blend_prefs(
                     _automix_blend_prefs(optimized, control)
+                )
+                self.mass.streams.audio.set_automix_stems_vetoes(
+                    _automix_stems_vetoes(optimized, control)
                 )
                 self.mass.streams.audio.set_automix_stems(control.stems_enabled)
                 self.mass.create_task(self.preroll_queue_analysis(queue_id, 10))
@@ -1356,7 +1631,19 @@ class SmartDJProvider(PluginProvider):
                 default_value=app_var(CONF_RAPIDAPI_KEY),
                 required=False,
             ),
+            ConfigEntry(
+                key=CONF_PREANALYSIS_ENABLED,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=True,
+                required=False,
+                requires_reload=False,
+                description=(
+                    "Analyze newly added library tracks in the background, using "
+                    "the same machinery and safeguards as the library sweep."
+                ),
+            ),
         )
+
 
     async def status(self) -> dict[str, Any]:
         """Return provider readiness without revealing credentials."""
@@ -1364,6 +1651,12 @@ class SmartDJProvider(PluginProvider):
             "configured": bool(self._key()),
             "musicae_host": MUSICAE_HOST,
             "cached_tracks": len(self._cache),
+            # quick-pull index progress (0.0.28 FE contract): indexed rows vs
+            # total library tracks. Both fields are OPTIONAL-friendly: absent
+            # or None reads as "unknown" on older/partial states, never an
+            # error.
+            "total_indexed": await self._status_total_indexed(),
+            "library_tracks": await self._status_library_tracks(),
         }
 
     async def pull_candidates(  # noqa: PLR0913 - filter surface mirrors spec 3.3
@@ -1465,6 +1758,13 @@ class SmartDJProvider(PluginProvider):
         self._library_scan_task: asyncio.Task[None] | None = None
         self._library_scan_cancel = asyncio.Event()
         self._library_scan_state: dict[str, Any] = {}
+        # Pre-analysis on arrival (0.0.28 lane B): bounded queue of newly
+        # added library tracks pending background analysis, drained by a
+        # single worker that reuses the sweep's machinery and safeguards.
+        self._preanalysis_queue: deque[Any] = deque()
+        self._preanalysis_pending_uris: set[str | None] = set()
+        self._preanalysis_task: asyncio.Task[None] | None = None
+        self._preanalysis_deferring = False
 
     async def loaded_in_mass(self) -> None:
         """Register the Smart DJ API commands and load the persistent cache."""
@@ -1473,6 +1773,15 @@ class SmartDJProvider(PluginProvider):
         # open is idempotent and the backfill only ADDS missing rows
         await asyncio.to_thread(self._quick_index.open)
         self._index_backfill_task = self.mass.create_task(self._quick_index_backfill())
+        # Pre-analysis on arrival (0.0.28 lane B): a MEDIA_ITEM_ADDED event for
+        # a track enqueues the item into the bounded pre-analysis queue; the
+        # worker reuses the sweep's machinery (same hard timeout, same
+        # concurrency limiter size, same deferral, same failure accounting,
+        # same _index_upsert success point). The returned unsubscribe handle
+        # is stored with the API handles so unload drops the listener too.
+        self._handles.append(
+            self.mass.subscribe(self._on_media_added, event_filter=EventType.MEDIA_ITEM_ADDED)
+        )
         handlers = (
             # rank_queue can replace the whole upcoming queue, so it is member-only:
             # LIBRARY_WRITE is the member/guest boundary (user/admin/service hold it,
@@ -1516,6 +1825,14 @@ class SmartDJProvider(PluginProvider):
 
     async def unload(self, is_removed: bool = False) -> None:
         """Close the HTTP client, drop the UI, and unregister commands."""
+        pre_task = self._preanalysis_task
+        if pre_task is not None and not pre_task.done():
+            pre_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await pre_task
+        self._preanalysis_task = None
+        self._preanalysis_queue.clear()
+        self._preanalysis_pending_uris.clear()
         scan_task = self._library_scan_task
         if scan_task is not None and not scan_task.done():
             self._library_scan_cancel.set()
@@ -1625,8 +1942,10 @@ class SmartDJProvider(PluginProvider):
           any player is PLAYING - the local analyzer is CPU-hungry and must
           never compete with live audio decode.
         - concurrency follows the streams background-scan setting (1-8,
-          default 2); each track has a hard timeout and its buffer is always
-          torn down.
+          default 2); each per-track attempt has a hard
+          ``ANALYSIS_ATTEMPT_TIMEOUT`` (45s) and its buffer is always torn
+          down - a timeout counts as a failure (breaker, errors,
+          ``recent_failures``).
         - a circuit breaker aborts the sweep after
           ``LIBRARY_SCAN_MAX_FAILURES`` consecutive failures instead of
           hammering a broken provider.
@@ -1680,6 +1999,7 @@ class SmartDJProvider(PluginProvider):
             "skipped": 0,
             "failed": 0,
             "errors": [],
+            "recent_failures": [],
             "deferring": False,
             "cancelled": False,
             "started_at": time.time(),
@@ -1843,6 +2163,53 @@ class SmartDJProvider(PluginProvider):
             ),
         }
 
+    async def _status_total_indexed(self) -> int:
+        """
+        Count quick-pull index rows, exactly the way pull_candidates does.
+
+        The FE's honest-progress line (0.0.28 lane E) reads this off
+        smart_dj/status. An empty index is simply 0; an unreadable one
+        degrades to 0 with a debug line - the status command must never
+        throw over bookkeeping.
+        """
+        total_indexed = 0
+        index = getattr(self, "_quick_index", None)
+        if index is not None:
+            try:
+                await asyncio.to_thread(index.open)
+                total_indexed = await asyncio.to_thread(index.count)
+            except (OSError, ValueError) as err:
+                self.logger.debug("Smart DJ status: index count unavailable: %s", err)
+                total_indexed = 0
+        return total_indexed
+
+    async def _status_library_tracks(self) -> int | None:
+        """
+        Total library track count, computed the way the sweep's total is.
+
+        Same ``library_items`` read + resolvable-item filter as the sweep's
+        ``total`` (same limit ceiling, same item_id+provider guard). A
+        library provider that is mid-sync (or otherwise failing) degrades
+        the field to None instead of failing the status command.
+        """
+        try:
+            library_items = await self.mass.music.tracks.library_items(
+                favorite=None,
+                search=None,
+                limit=LIBRARY_SCAN_MAX_TRACKS,
+                offset=0,
+                order_by="sort_name",
+                summary=False,
+            )
+            return sum(
+                1
+                for item in library_items
+                if getattr(item, "item_id", None) and getattr(item, "provider", None)
+            )
+        except Exception as err:  # any mid-sync failure degrades, never throws
+            self.logger.debug("Smart DJ status: library count unavailable: %s", err)
+            return None
+
     async def _resolve_track_uris(self, track_uris: list[str]) -> tuple[list[Any], list[str]]:
         """
         Resolve a track-uri list to full media items (0.0.27 mix_tracks).
@@ -1992,7 +2359,9 @@ class SmartDJProvider(PluginProvider):
                 self.mass.streams.audio.set_automix_durations(
                     {
                         id_map[mix_id]: secs
-                        for mix_id, secs in _automix_durations(optimized, control).items()
+                        for mix_id, secs in _automix_durations(
+                            optimized, control, previous=anchor
+                        ).items()
                         if mix_id in id_map
                     }
                 )
@@ -2000,6 +2369,15 @@ class SmartDJProvider(PluginProvider):
                     {
                         id_map[mix_id]: pref
                         for mix_id, pref in _automix_blend_prefs(
+                            optimized, control, previous=anchor
+                        ).items()
+                        if mix_id in id_map
+                    }
+                )
+                self.mass.streams.audio.set_automix_stems_vetoes(
+                    {
+                        id_map[mix_id]: veto
+                        for mix_id, veto in _automix_stems_vetoes(
                             optimized, control, previous=anchor
                         ).items()
                         if mix_id in id_map
@@ -2019,6 +2397,9 @@ class SmartDJProvider(PluginProvider):
                 "count": len(optimized),
                 "tracks": optimized,
                 "automix": automix_info,
+                # per-transition derived bars + reasons (0.0.28 lane C): the
+                # panel surface reads these from the mix response
+                "transition_notes": _transition_report([anchor, *optimized], control),
                 "hard_requirements": {"blocked": False, "rules": []},
             }
 
@@ -2086,6 +2467,13 @@ class SmartDJProvider(PluginProvider):
                     if mix_id in fresh_ids
                 }
             )
+            self.mass.streams.audio.set_automix_stems_vetoes(
+                {
+                    fresh_ids[mix_id]: veto
+                    for mix_id, veto in _automix_stems_vetoes(analyzed, control).items()
+                    if mix_id in fresh_ids
+                }
+            )
             self.mass.streams.audio.set_automix_stems(control.stems_enabled)
             # silent background preroll: analyze upcoming tracks so blends
             # improve as the queue plays (no audible output)
@@ -2101,6 +2489,9 @@ class SmartDJProvider(PluginProvider):
             "count": len(ordered_media),
             "tracks": optimized,
             "automix": automix_info,
+            # per-transition derived bars + reasons (0.0.28 lane C): the
+            # panel surface reads these from the mix response
+            "transition_notes": _transition_report(optimized, control),
             "hard_requirements": {"blocked": False, "rules": []},
         }
 
@@ -2760,6 +3151,23 @@ class SmartDJProvider(PluginProvider):
                 out.append((str(item_id), str(prov)))
         return out
 
+    async def _sweep_attempt(self, track: Any) -> bool:
+        """
+        Run one sweep track's analysis attempts under the hard timeout.
+
+        True when any provider mapping stored a new analysis. Raises
+        TimeoutError when a single attempt exceeds ANALYSIS_ATTEMPT_TIMEOUT;
+        wait_for's cancellation is torn down by _analyze_media_silent's
+        finally (buffer.clear evicts the session).
+        """
+        for a_item_id, a_instance in self._analysis_targets_for_track(track):
+            if await asyncio.wait_for(
+                self._analyze_media_silent(a_item_id, a_instance, track=track),
+                timeout=ANALYSIS_ATTEMPT_TIMEOUT,
+            ):
+                return True
+        return False
+
     async def _library_scan_worker(
         self, targets: list[Any], state: dict[str, Any], pause_while_playing: bool
     ) -> None:
@@ -2792,17 +3200,29 @@ class SmartDJProvider(PluginProvider):
                     state["deferring"] = False
                     state["skipped"] += 1
                     return
+                raw_id = getattr(track, "item_id", None)
+                track_id = str(raw_id) if raw_id else "unknown"
+                track_name = _sweep_track_name(track)
                 try:
-                    done = False
-                    for a_item_id, a_instance in self._analysis_targets_for_track(track):
-                        if await self._analyze_media_silent(a_item_id, a_instance, track=track):
-                            done = True
-                            break
+                    done = await self._sweep_attempt(track)
+                except TimeoutError:
+                    # hard timeout: the producer was cancelled (wait_for) and
+                    # _analyze_media_silent's finally evicted the session
+                    failures += 1
+                    state["failed"] += 1
+                    reason = f"timeout after {ANALYSIS_ATTEMPT_TIMEOUT}s"
+                    self.logger.warning(
+                        "Smart DJ sweep: analysis of %s (%s) %s - producer cancelled",
+                        track_name,
+                        track_id,
+                        reason,
+                    )
+                    _record_sweep_failure(state, track_id, track_name, reason)
+                    return
                 except Exception as err:
                     failures += 1
                     state["failed"] += 1
-                    if len(state["errors"]) < LIBRARY_SCAN_MAX_ERRORS_SHOWN:
-                        state["errors"].append(str(err)[:200])
+                    _record_sweep_failure(state, track_id, track_name, str(err))
                     return
                 if done:
                     failures = 0
@@ -2820,6 +3240,132 @@ class SmartDJProvider(PluginProvider):
             state["finished_at"] = time.time()
             self._library_scan_task = None
             await self._save_cache()
+
+    def _preanalysis_enabled(self) -> bool:
+        """
+        Read the pre-analysis toggle from the provider settings (default ON).
+
+        The explicit ``True`` default matters: get_value returns None for a
+        key that was never stored (e.g. a provider instance configured before
+        this setting existed), and ``bool(None)`` would silently turn the
+        feature OFF despite its declared default.
+        """
+        return bool(self.config.get_value(CONF_PREANALYSIS_ENABLED, True))
+
+    async def _on_media_added(self, event: MassEvent) -> None:
+        """
+        React to a MEDIA_ITEM_ADDED event: queue new tracks for pre-analysis.
+
+        Everything that is not a track (albums, playlists, genres, ...) is
+        ignored; the toggle is read live so the setting applies without a
+        provider reload. Bulk provider syncs never reach this (per-item
+        events are suppressed during a sync).
+        """
+        item = getattr(event, "data", None)
+        if getattr(item, "media_type", None) != MediaType.TRACK:
+            return
+        if not self._preanalysis_enabled():
+            return
+        self._preanalysis_enqueue(item)
+
+    def _preanalysis_enqueue(self, track: Any) -> None:
+        """
+        Queue one newly added track for background analysis.
+
+        Bounded by PREANALYSIS_QUEUE_MAX: when full, the OLDEST pending track
+        is dropped with a WARNING so a burst of additions cannot grow the
+        queue without limit. Duplicate uris are not queued twice.
+        """
+        uri = getattr(track, "uri", None)
+        if uri and uri in self._preanalysis_pending_uris:
+            return
+        while len(self._preanalysis_queue) >= PREANALYSIS_QUEUE_MAX:
+            dropped = self._preanalysis_queue.popleft()
+            self._preanalysis_pending_uris.discard(getattr(dropped, "uri", None))
+            self.logger.warning(
+                "Smart DJ pre-analysis: pending queue full (%d), dropping oldest "
+                "track %s to keep the queue bounded",
+                PREANALYSIS_QUEUE_MAX,
+                _sweep_track_name(dropped),
+            )
+        if uri:
+            self._preanalysis_pending_uris.add(uri)
+        self._preanalysis_queue.append(track)
+        if self._preanalysis_task is None or self._preanalysis_task.done():
+            self._preanalysis_task = self.mass.create_task(self._preanalysis_worker())
+
+    async def _preanalysis_worker(self) -> None:
+        """
+        Drain the bounded pre-analysis queue with the sweep's safeguards.
+
+        Same machinery as the sweep (0.0.28 lane B): each track goes through
+        ``_sweep_attempt`` under the same hard per-track timeout, behind a
+        semaphore sized by the same background-concurrency setting, deferring
+        while any player streams, with the same consecutive-failure circuit
+        breaker (reset on success, abort after LIBRARY_SCAN_MAX_FAILURES).
+        Success flows through ``_analyze_media_silent``'s existing
+        ``_index_upsert`` success point, so a track analyzed on arrival lands
+        in the quick-pull index exactly like a sweep-analyzed track.
+        """
+        sem = asyncio.Semaphore(self._background_concurrency())
+        failures = 0
+        try:
+            while self._preanalysis_queue:
+                # breaker checked before dispatch (same as the sweep): nothing
+                # half-done is left behind, a broken provider stops the drain
+                if failures >= LIBRARY_SCAN_MAX_FAILURES:
+                    self.logger.warning(
+                        "Smart DJ pre-analysis: aborted after %d consecutive "
+                        "failures, dropping %d pending track(s)",
+                        failures,
+                        len(self._preanalysis_queue),
+                    )
+                    self._preanalysis_queue.clear()
+                    self._preanalysis_pending_uris.clear()
+                    break
+                track = self._preanalysis_queue.popleft()
+                self._preanalysis_pending_uris.discard(getattr(track, "uri", None))
+                async with sem:
+                    while self._any_player_playing():
+                        self._preanalysis_deferring = True
+                        await asyncio.sleep(LIBRARY_SCAN_POLL_SECONDS)
+                    self._preanalysis_deferring = False
+                    track_id = str(getattr(track, "item_id", None) or "unknown")
+                    track_name = _sweep_track_name(track)
+                    try:
+                        done = await self._sweep_attempt(track)
+                    except TimeoutError:
+                        failures += 1
+                        reason = f"timeout after {ANALYSIS_ATTEMPT_TIMEOUT}s"
+                        self.logger.warning(
+                            "Smart DJ pre-analysis: analysis of %s (%s) %s - producer cancelled",
+                            track_name,
+                            track_id,
+                            reason,
+                        )
+                        continue
+                    except Exception as err:
+                        failures += 1
+                        self.logger.warning(
+                            "Smart DJ pre-analysis: analysis of %s (%s) failed: %s",
+                            track_name,
+                            track_id,
+                            err,
+                        )
+                        continue
+                    if done:
+                        failures = 0
+            if failures >= LIBRARY_SCAN_MAX_FAILURES:
+                # the drain ended exactly on the breaker (queue exhausted on a
+                # failure) - say so, same as the sweep's epilogue
+                self.logger.warning(
+                    "Smart DJ pre-analysis: stopped after %d consecutive failures",
+                    failures,
+                )
+                self._preanalysis_pending_uris.clear()
+        finally:
+            self._preanalysis_deferring = False
+            self._preanalysis_task = None
 
     async def _analyze_media_silent(
         self, item_id: str, provider_id: str, track: Any = None

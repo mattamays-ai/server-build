@@ -1,3 +1,26 @@
+## 0.0.28
+
+- **Fixed: the silent 600-second sweep hang** — per-track analysis attempts now
+  carry a hard 45-second timeout; a hung stream counts toward the failure
+  circuit breaker, is logged with the track name, and appears in the sweep
+  status (recent_failures, last 10) instead of burning ten invisible minutes.
+- **Pre-analysis on arrival** — tracks entering the library are queued for
+  background analysis automatically (same machinery, concurrency, deferral and
+  breaker as the sweep; bounded queue of 50, drop-oldest). Toggle in provider
+  settings, default on. No more cold-start wait before the first mix.
+- **Contextual transition bars** — transition_bars is now derived per
+  transition: genre-family phrase math bounds the base, the energy arc picks
+  the long stop on climbs and the short stop on resets, known vocal-vs-vocal
+  boundaries stay short. The derived value and reason are exposed in the mix
+  response (transition_bars_reason); user overrides always win.
+- **Per-transition stems veto** — when stem separation would hurt the overlap
+  (near-instrumental outgoing, dominant outgoing vocal, or unusable mask
+  energy), the transition runs dry and the mix response says so (stems_used,
+  stems_veto_reason). The stems toggle remains the master control.
+- FE: honest library-analysis progress line ("Analyzing library, X/Y done —
+  mixes will be slow until then"), sweep failure rows in the panel, stems-veto
+  display + override control.
+
 ## 0.0.27
 
 - Hard-requirements insight panel: when a mix plan is blocked, the response carries

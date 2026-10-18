@@ -1,6 +1,8 @@
 """Focused Smart DJ provider tests."""
 
 import inspect
+import logging
+from types import SimpleNamespace
 from typing import Any
 
 from music_assistant.providers.smart_dj.engine import (
@@ -15,6 +17,7 @@ from music_assistant.providers.smart_dj.provider import (
     _camelot_from_key,
     _snapshot_start_index,
 )
+from music_assistant.providers.smart_dj.quick_index import QuickIndex, derive_row
 
 
 def test_camelot_conversion() -> None:
@@ -181,3 +184,61 @@ def test_analyze_registration_requires_library_write() -> None:
     ]
     assert len(none_scoped) == 2
     assert all("status" in line or "capabilities" in line for line in none_scoped)
+
+
+# ------------------------------------------------------------------
+# smart_dj/status FE-progress fields (0.0.28 lane B)
+# ------------------------------------------------------------------
+
+
+def _status_prov(tmp_path: Any, rows: list[Any] | Exception) -> Any:
+    """Build a bare provider with a seeded quick index and a fake library read."""
+    prov = SmartDJProvider.__new__(SmartDJProvider)
+    prov.logger = logging.getLogger("smart_dj_test")
+    prov._cache = {}
+    prov._quick_index = QuickIndex(tmp_path / "qi.sqlite3")
+    prov._quick_index.open()
+
+    async def _library_items(**_kwargs: Any) -> list[Any]:
+        if isinstance(rows, Exception):
+            raise rows
+        return rows
+
+    prov.mass = SimpleNamespace(  # type: ignore[assignment]
+        music=SimpleNamespace(tracks=SimpleNamespace(library_items=_library_items))
+    )
+    prov.config = SimpleNamespace(get_value=lambda _key: None)  # type: ignore[assignment]
+    return prov
+
+
+async def test_status_reports_index_and_library_counts(tmp_path: Any) -> None:
+    """Status carries total_indexed (index rows) + library_tracks (sweep math)."""
+    prov = _status_prov(
+        tmp_path,
+        [
+            SimpleNamespace(item_id="a", provider="p1"),
+            SimpleNamespace(item_id="b", provider="p1"),
+            SimpleNamespace(item_id="no-provider", provider=None),  # filtered out
+        ],
+    )
+    prov._quick_index.upsert(derive_row("a", "p1", {"bpm": 128.0}))
+    prov._quick_index.upsert(derive_row("b", "p1", {"bpm": 130.0}))
+    status = await prov.status()
+    assert status["total_indexed"] == 2
+    assert status["library_tracks"] == 2
+
+
+async def test_status_empty_index_is_zero_not_error(tmp_path: Any) -> None:
+    """An empty index degrades total_indexed to 0 and the command never throws."""
+    prov = _status_prov(tmp_path, [SimpleNamespace(item_id="a", provider="p1")])
+    status = await prov.status()
+    assert status["total_indexed"] == 0
+    assert status["library_tracks"] == 1
+
+
+async def test_status_mid_sync_library_degrades_to_none(tmp_path: Any) -> None:
+    """A library provider failing mid-sync yields library_tracks=None, no raise."""
+    prov = _status_prov(tmp_path, RuntimeError("provider is mid-sync"))
+    status = await prov.status()
+    assert status["total_indexed"] == 0
+    assert status["library_tracks"] is None

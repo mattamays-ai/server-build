@@ -92,10 +92,10 @@ def test_rule_ids_are_stable_snake_case() -> None:
 
 
 def test_bars_clamped_for_pop_pairs() -> None:
-    """Global 32 bars over a pop pair clamps to the 16 hard cap."""
+    """Global 32 bars over a pop pair derives to the 8-bar living range."""
     control = DJControls(transition_bars=32)
     resolved = _pair_style({"genre": "Pop"}, {"genre": "Hip-Hop"}, control)
-    assert resolved["bars"] == 16
+    assert resolved["bars"] == 8
     assert RULE_TRANSITION_BARS_CAPPED in resolved["rules"]
 
 
@@ -134,7 +134,7 @@ def test_transition_report_carries_rules_and_bars() -> None:
     note = notes[0]
     assert note["style"] == "radio"  # incoming pop profile fills the pin
     assert note["source"] == "genre"
-    assert note["transition_bars"] == 16  # pop side caps the pair
+    assert note["transition_bars"] == 8  # the pop-family phrase math derives 8
     assert isinstance(note["rules"], list)
 
 

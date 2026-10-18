@@ -321,6 +321,8 @@ class BlendPrefs:
     # Vocal ducking on the outgoing overlap via MDX-Net stems (smart_fades/stems.py).
     # Soft by design: when the runtime or model is missing, the duck silently
     # does not apply and the transition falls back to the plain blend.
+    # A per-transition veto (Smart DJ stems veto, 0.0.28) may also keep this
+    # False for a pair where separation is likely to hurt the mix.
     stems: bool = False
 
 

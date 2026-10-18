@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -26,6 +27,7 @@ def _sweep_prov(
 ) -> SmartDJProvider:
     """Build a bare provider wired for sweep tests (no real MA underneath)."""
     prov = SmartDJProvider.__new__(SmartDJProvider)
+    prov.logger = logging.getLogger("smart_dj_sweep_test")
     prov._library_scan_task = None
     prov._library_scan_cancel = asyncio.Event()
     prov._library_scan_state = {}
@@ -174,3 +176,29 @@ async def test_registration_scope_is_library_write() -> None:
         '("smart_dj/analyze_library_local", self.analyze_library_local, Scope.LIBRARY_WRITE)'
         in source
     )
+
+
+async def test_sweep_timeout_counts_as_failure() -> None:
+    """A per-track hard timeout is an honest failure: breaker, errors, rows."""
+
+    async def _hung(_item_id: str, _provider_id: str, **_kwargs: Any) -> bool:
+        await asyncio.sleep(300)
+        return True
+
+    prov = _sweep_prov(tracks=1, silent=_hung)
+    real_timeout = provider_module.ANALYSIS_ATTEMPT_TIMEOUT
+    provider_module.ANALYSIS_ATTEMPT_TIMEOUT = 0.05  # type: ignore[assignment]
+    try:
+        await prov.analyze_library_local(command="start")
+        final = await _finished(prov)
+    finally:
+        provider_module.ANALYSIS_ATTEMPT_TIMEOUT = real_timeout
+    assert final["running"] is False
+    assert final["failed"] == 1
+    assert final["analyzed"] == 0
+    assert any("timeout after" in e for e in final["errors"])
+    rows = final["recent_failures"]
+    assert len(rows) == 1
+    assert rows[0]["item_id"] == "t0"
+    assert rows[0]["name"] == "t0"
+    assert "timeout after" in rows[0]["reason"]
