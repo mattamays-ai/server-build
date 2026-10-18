@@ -1,3 +1,24 @@
+## 0.0.27
+
+- Hard-requirements insight panel: when a mix plan is blocked, the response carries
+  the actual-vs-limit rule rows (beat stretch incl. vocal halving, key affinity,
+  energy, danceability, loudness, genre, artist spacing) severity-sorted, with
+  suggested fixes targeting beatStrictness (swap-tracks when nothing loosens far
+  enough).
+- Pair-aware transition-style resolution: genre pins now consult BOTH tracks
+  (house->hip-hop no longer takes hip-hop's style); quick_cut blocked over
+  four-on-the-floor pairs, double-drop DnB-only, backspin never auto-selected,
+  per-genre transition_bars caps.
+- Floating energy-arc control (energy_arc): user-adjustable arc asymmetry
+  (climb cap, resets, warm-up) shaping scoring; the hard gate stays symmetric.
+- New smart_dj/mix_tracks command: mix an explicit track-uri list (mix_playlist's
+  pipeline shared via _mix_resolved).
+- Derived quick-pull index in the Smart DJ storage dir, upserted at both analysis
+  success points, plus smart_dj/pull_candidates and index-first planner
+  pool-pulling (pool_source=full bypass for A/B).
+- FE: library browser (playlists/artists/tracks with in-list search, per-playlist
+  Analyze), stems toggle, save_sorted_playlist menu, tap-to-expand plain-language
+  definitions on every panel row and term.
 # Changelog
 
 All notable changes to the Smart DJ Music Assistant add-on.

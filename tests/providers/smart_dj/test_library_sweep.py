@@ -36,7 +36,7 @@ def _sweep_prov(
     async def _noop() -> None:
         return None
 
-    async def _default_silent(_item_id: str, _provider_id: str) -> bool:
+    async def _default_silent(_item_id: str, _provider_id: str, **_kwargs: Any) -> bool:
         return True
 
     prov.mass = cast(
@@ -94,7 +94,7 @@ async def test_sweep_counts_analyzed_and_is_idempotent() -> None:
 async def test_sweep_skips_already_analyzed() -> None:
     """False from the silent analyzer counts as skipped, not failed."""
 
-    async def _already(_item_id: str, _provider_id: str) -> bool:
+    async def _already(_item_id: str, _provider_id: str, **_kwargs: Any) -> bool:
         return False
 
     prov = _sweep_prov(tracks=2, silent=_already)
@@ -136,7 +136,7 @@ async def test_sweep_plays_through_when_pause_disabled() -> None:
 async def test_cancel_stops_the_sweep() -> None:
     """Cancel marks the state cancelled and the worker stops cleanly."""
 
-    async def _slow(_item_id: str, _provider_id: str) -> bool:
+    async def _slow(_item_id: str, _provider_id: str, **_kwargs: Any) -> bool:
         await asyncio.sleep(30)
         return True
 
@@ -153,7 +153,7 @@ async def test_failure_circuit_breaker_aborts() -> None:
     """After LIBRARY_SCAN_MAX_FAILURES consecutive failures the sweep aborts."""
     calls = 0
 
-    async def _broken(_item_id: str, _provider_id: str) -> bool:
+    async def _broken(_item_id: str, _provider_id: str, **_kwargs: Any) -> bool:
         nonlocal calls
         calls += 1
         raise RuntimeError("provider exploded")

@@ -82,6 +82,15 @@ class DJControls:
     # double-vocal handoff. Soft: degrades to the plain blend when the
     # separation runtime/model is unavailable.
     stems_enabled: bool = False
+    # Energy-arc asymmetry (0.0.27, FLOATING user control): when True the
+    # SCORING target becomes position-aware -- climbs are capped at ~1 tier
+    # (halved during a segment's warm-up), drops of 2-3 tiers count as a
+    # reset (max one per segment), and every arc-shaped choice carries an
+    # "arc: lift/hold/reset" reason so the FE can show why. Scoring ONLY:
+    # the hard gate stays symmetric, because an asymmetric veto would brick
+    # legitimate resets ("Hard requirements are impossible"). Default False
+    # preserves today's behavior exactly.
+    energy_arc: bool = False
     lookahead: int = 8
     # Blend style preference passed to the smart-fades planner: auto (engine
     # decides), full_blend (force the 16-bar blend when the grid allows),
@@ -241,6 +250,30 @@ def _artist_run_length(
 # aggressive=12%, matching the documented DJControls.beat_strictness contract.
 BEAT_STRETCH_LIMITS = {"strict": 0.06, "normal": 0.08, "aggressive": 0.12}
 
+# Hard-gate scales shared by _hard_fail and _violation_details, so the
+# hard-requirements insight panel re-derives the SAME limits the planner
+# actually enforced (0.0.27 spec Item 2 - one authority, two readers).
+ENERGY_DELTA_LIMIT = 0.35
+DANCEABILITY_DELTA_LIMIT = 0.45
+LOUDNESS_DELTA_LIMIT = 8.0
+
+
+class HardRequirementsImpossible(RuntimeError):
+    """
+    No ordering of the queue satisfies the hard constraints.
+
+    Subclasses RuntimeError so every existing ``except RuntimeError`` and
+    ``pytest.raises(RuntimeError, match="Hard requirements ...")`` keeps
+    working; ``details`` carries the re-derived actual-vs-limit rows the
+    provider surfaces fail-soft on a plan response (SmartDJError only
+    carries strings, so structured panel data cannot ride an error raise).
+    """
+
+    def __init__(self, message: str, details: list[dict[str, Any]] | None = None) -> None:
+        """Keep the historical message; attach the violation detail rows."""
+        super().__init__(message)
+        self.details: list[dict[str, Any]] = details or []
+
 
 def _hard_fail(  # noqa: PLR0915,C901,PLR0912 - every hard rule reads clearest inline
     current: dict[str, Any] | None,
@@ -321,12 +354,12 @@ def _hard_fail(  # noqa: PLR0915,C901,PLR0912 - every hard rule reads clearest i
         a, b = current.get("energy"), candidate.get("energy")
         if not isinstance(a, (int, float)) or not isinstance(b, (int, float)):
             violations.append("hard energy compatibility unavailable")
-        elif abs(float(a) - float(b)) > 0.35:
+        elif abs(float(a) - float(b)) > ENERGY_DELTA_LIMIT:
             violations.append("hard energy compatibility")
 
     for field_name, label, scale in (
-        ("danceability", "danceability", 0.45),
-        ("loudness", "loudness", 8.0),
+        ("danceability", "danceability", DANCEABILITY_DELTA_LIMIT),
+        ("loudness", "loudness", LOUDNESS_DELTA_LIMIT),
     ):
         control = getattr(controls, field_name)
         if control.state == "hard" and current:
@@ -356,6 +389,64 @@ def _hard_fail(  # noqa: PLR0915,C901,PLR0912 - every hard rule reads clearest i
     return violations
 
 
+# Energy-arc asymmetry (0.0.27): the 0-1 energy scale reads ~0.2 per "tier".
+# Climbs are capped at ~1 tier (halved during a segment's warm-up third);
+# drops of 2-3 tiers are a RESET, allowed at most once per segment; after
+# the reset is spent, further big drops are restrained. These shape
+# _signal_values scoring only when controls.energy_arc is on -- the hard
+# gate never sees them, so legitimate resets are never vetoed.
+ARC_CLIMB_MAX: float = 0.2
+ARC_RESET_DROP: float = 0.4
+ARC_MAX_RESETS: int = 1
+ARC_WARMUP_FRACTION: float = 1 / 3
+
+
+def _arc_step(
+    cur_e: float,
+    cand_e: float,
+    base_step: float,
+    position: int,
+    segment_length: int,
+    resets: int,
+) -> tuple[float, str]:
+    """
+    Position-aware arc target step replacing the mode's flat energy direction.
+
+    Returns (step, reason): the target the candidate's energy is scored
+    against becomes ``current + step``, and the reason is one of
+    "arc: lift/hold/reset" so the FE can show WHY the pair scored as it did.
+    """
+    delta = cand_e - cur_e
+    warmup = segment_length > 0 and position < segment_length * ARC_WARMUP_FRACTION
+    climb_cap = ARC_CLIMB_MAX * (0.5 if warmup else 1.0)
+    if delta > climb_cap:
+        # climbing past ~1 tier overshoots the arc: hold the target at the cap
+        return climb_cap, "arc: hold"
+    if delta <= -ARC_RESET_DROP:
+        if resets >= ARC_MAX_RESETS:
+            # the segment's one reset is spent: restrain further big drops
+            return -ARC_CLIMB_MAX, "arc: hold"
+        return delta, "arc: reset"
+    if delta > 0 and base_step > 0:
+        return min(base_step, climb_cap), "arc: lift"
+    return base_step, "arc: hold"
+
+
+def _arc_reset_count(anchor: dict[str, Any] | None, path: list[dict[str, Any]]) -> int:
+    """Count arc resets (drops >= ARC_RESET_DROP) already taken on a path."""
+    steps = ([anchor] if anchor else []) + [_merge_track(item) for item in path]
+    resets = 0
+    for idx in range(1, len(steps)):
+        # a legit 0.0 energy must NOT fall through the `or`-default (M-5)
+        prev_raw = steps[idx - 1].get("energy")
+        next_raw = steps[idx].get("energy")
+        prev_e = float(prev_raw) if isinstance(prev_raw, (int, float)) else 0.5
+        next_e = float(next_raw) if isinstance(next_raw, (int, float)) else 0.5
+        if next_e - prev_e <= -ARC_RESET_DROP:
+            resets += 1
+    return resets
+
+
 def _signal_values(
     current: dict[str, Any],
     candidate: dict[str, Any],
@@ -363,7 +454,24 @@ def _signal_values(
     controls: DJControls,
     *,
     artist_run_length: int,
+    position: int = 0,
+    segment_length: int = 0,
+    arc_resets: int = 0,
 ) -> tuple[float, list[str]]:
+    # Energy-arc target (0.0.27): with the control ON, the mode's flat energy
+    # direction is replaced by a position-aware arc step; OFF keeps today's
+    # symmetric scoring exactly (defaults preserve the old behavior).
+    energy_step = mode.energy_direction
+    arc_reason: str | None = None
+    if controls.energy_arc and current:
+        energy_step, arc_reason = _arc_step(
+            float(current.get("energy") or 0.5),
+            float(candidate.get("energy") or 0.5),
+            mode.energy_direction,
+            position,
+            segment_length,
+            arc_resets,
+        )
     w = mode.weights
     values = {
         "bpm": _norm_delta(
@@ -377,7 +485,7 @@ def _signal_values(
             1.0
             - abs(
                 float(candidate.get("energy") or 0.5)
-                - (float(current.get("energy") or 0.5) + mode.energy_direction)
+                - (float(current.get("energy") or 0.5) + energy_step)
             )
             / 0.35,
         ),
@@ -417,6 +525,8 @@ def _signal_values(
             reasons.append("sonic similarity strong" if value >= 0.60 else "sonic similarity weak")
         elif value >= 0.85:
             reasons.append(f"{name.replace('_', ' ')} strong")
+    if arc_reason:
+        reasons.append(arc_reason)
     if controls.instrumental == "prefer":
         if candidate.get("instrumental") is True:
             total += 0.10
@@ -514,6 +624,9 @@ def score_candidate(
     controls: DJControls,
     *,
     artist_run_length: int = 0,
+    position: int = 0,
+    segment_length: int = 0,
+    arc_resets: int = 0,
 ) -> tuple[float, list[str], list[str]]:
     """
     Score one candidate against the current track.
@@ -529,7 +642,14 @@ def score_candidate(
     if current is None:
         return 0.5, ["no current-track anchor"], []
     score, reasons = _signal_values(
-        current, candidate, mode, controls, artist_run_length=artist_run_length
+        current,
+        candidate,
+        mode,
+        controls,
+        artist_run_length=artist_run_length,
+        position=position,
+        segment_length=segment_length,
+        arc_resets=arc_resets,
     )
     return score, reasons, []
 
@@ -569,14 +689,33 @@ def _beam_pass(
     controls: DJControls,
     beam_width: int,
     anchor_artist: str | None,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
+    """
+    Run one beam pass, also returning the best-rejected candidate capture.
+
+    The capture is the highest-ranked hard-failed pair (ranked by the soft
+    signal it WOULD have scored, since score_candidate returns 0.0 for every
+    rejected candidate). The hard-requirements insight panel re-derives its
+    actual-vs-limit numbers from this record; it is None when nothing was
+    rejected on this pass.
+    """
     beams: list[tuple[float, list[dict[str, Any]], list[dict[str, Any]]]] = [
         (0.0, [], list(segment))
     ]
+    best_rejection: dict[str, Any] | None = None
     for _ in range(len(segment)):
         next_beams: list[tuple[float, list[dict[str, Any]], list[dict[str, Any]]]] = []
         for total, path, remaining in beams:
             current = _merge_track(path[-1]) if path else anchor
+            arc_kwargs = (
+                {
+                    "position": len(path),
+                    "segment_length": len(segment),
+                    "arc_resets": _arc_reset_count(anchor, path),
+                }
+                if controls.energy_arc
+                else {}
+            )
             for candidate in remaining:
                 data = _merge_track(candidate)
                 run = _artist_run_length(
@@ -585,9 +724,23 @@ def _beam_pass(
                     anchor_artist=anchor_artist,
                 )
                 score, reasons, violations = score_candidate(
-                    current, data, mode, controls, artist_run_length=run
+                    current, data, mode, controls, artist_run_length=run, **arc_kwargs
                 )
                 if violations:
+                    rank = 0.0
+                    if current is not None:
+                        rank, _ = _signal_values(
+                            current, data, mode, controls, artist_run_length=run, **arc_kwargs
+                        )
+                    if best_rejection is None or rank > best_rejection["rank"]:
+                        best_rejection = {
+                            "rank": rank,
+                            "current": current,
+                            "candidate": data,
+                            "violations": violations,
+                            "artist_run_length": run,
+                            "controls": controls,
+                        }
                     continue
                 item = {**candidate, "score": score, "reasons": reasons}
                 next_beams.append(
@@ -597,7 +750,7 @@ def _beam_pass(
         beams = next_beams[:beam_width]
         if not beams:
             break
-    return beams[0][1] if beams else []
+    return (beams[0][1] if beams else []), best_rejection
 
 
 def _optimize_segment(
@@ -606,17 +759,17 @@ def _optimize_segment(
     mode: DJMode,
     controls: DJControls,
     beam_width: int,
-) -> list[dict[str, Any]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     anchor_artist = anchor.get("artist") if anchor else None
-    optimized = _beam_pass(segment, anchor, mode, controls, beam_width, anchor_artist)
+    optimized, rejection = _beam_pass(segment, anchor, mode, controls, beam_width, anchor_artist)
     if len(optimized) != len(segment) and anchor_artist is not None:
         # The anchor boundary can make the artist-run constraint unsatisfiable
         # (e.g. the queue continues the now-playing artist): no ordering of the
         # segment can satisfy it, and bailing out fails the whole queue. The
         # queue is fixed reality; the optimizer only chooses the order. Retry
         # with the boundary constraint relaxed rather than brick the queue.
-        optimized = _beam_pass(segment, anchor, mode, controls, beam_width, None)
-    return optimized
+        optimized, rejection = _beam_pass(segment, anchor, mode, controls, beam_width, None)
+    return optimized, rejection
 
 
 def beam_optimize(  # noqa: PLR0915 - placement pipeline reads best as one pass
@@ -656,6 +809,7 @@ def beam_optimize(  # noqa: PLR0915 - placement pipeline reads best as one pass
     # Optimize each interval between fixed anchors. Excluded tracks do not occupy
     # an output slot, so they must not affect segment sizing.
     result: list[dict[str, Any]] = []
+    best_rejection: dict[str, Any] | None = None
     fixed_indices = sorted(fixed_positions)
     interval_starts = [0, *[idx + 1 for idx in fixed_indices]]
     interval_ends = [*fixed_indices, len(tracks)]
@@ -671,9 +825,16 @@ def beam_optimize(  # noqa: PLR0915 - placement pipeline reads best as one pass
                 if result and not isinstance(result[-1].get("analysis"), dict)
                 else (_merge_track(result[-1]) if result else current)
             )
-            optimized = _optimize_segment(segment, anchor, mode, controls, beam_width)
+            optimized, rejection = _optimize_segment(segment, anchor, mode, controls, beam_width)
+            if rejection is not None and (
+                best_rejection is None or rejection["rank"] > best_rejection["rank"]
+            ):
+                best_rejection = rejection
             if len(optimized) != len(segment):
-                raise RuntimeError("Hard requirements are impossible with the current queue")
+                raise HardRequirementsImpossible(
+                    "Hard requirements are impossible with the current queue",
+                    _violation_details(best_rejection),
+                )
             result.extend(optimized)
         if end < len(tracks):
             fixed = fixed_positions[end]
@@ -751,3 +912,200 @@ def beam_optimize(  # noqa: PLR0915 - placement pipeline reads best as one pass
         )
         previous = analysis
     return annotated
+
+
+# ---------------------------------------------------------------------------
+# Hard-requirements insight panel (0.0.27 spec Item 2)
+# ---------------------------------------------------------------------------
+
+# Severity sort weights per rule family (research spec §2.1): rows sort by
+# overshoot_ratio x weight. Families outside the map sort last.
+_VIOLATION_WEIGHTS = {"bpm": 1.0, "key": 0.8, "energy": 0.6, "artist": 0.4}
+
+
+def _beat_stretch_limit_pct(controls: DJControls, either_vocal: bool) -> float:
+    """Return the hard BPM gate as a percent of the anchor BPM (vocal-halving included)."""
+    limit = BEAT_STRETCH_LIMITS.get(controls.beat_strictness, 0.08)
+    if either_vocal:
+        limit *= 0.5
+    return limit * 100.0
+
+
+def _violation_severity(row: dict[str, Any]) -> float:
+    """Sort key for violation rows: overshoot_ratio x family weight."""
+    family = str(row.get("rule") or "").split("_", 1)[0]
+    weight = _VIOLATION_WEIGHTS.get(family, 0.2)
+    actual, limit = row.get("actual"), row.get("limit")
+    if (
+        isinstance(actual, (int, float))
+        and isinstance(limit, (int, float))
+        and not isinstance(actual, bool)
+        and not isinstance(limit, bool)
+        and float(limit) > 0
+    ):
+        return min(float(actual) / float(limit), 10.0) * weight
+    return weight
+
+
+def _violation_row(
+    violation: str,
+    current: dict[str, Any] | None,
+    candidate: dict[str, Any],
+    controls: DJControls,
+    artist_run_length: int,
+) -> dict[str, Any]:
+    """Re-derive actual-vs-limit numbers for ONE hard-rule violation string."""
+    row: dict[str, Any] = {
+        "rule": violation,
+        "actual": None,
+        "limit": None,
+        "unit": None,
+        "suggested_setting": None,
+        "suggested_value": None,
+    }
+    cur = current if isinstance(current, dict) else {}
+    bpm_cur, bpm_cand = cur.get("bpm"), candidate.get("bpm")
+
+    if violation == "maximum BPM jump exceeded":
+        if isinstance(bpm_cur, (int, float)) and isinstance(bpm_cand, (int, float)):
+            row.update(
+                rule="bpm_delta",
+                actual=round(abs(float(bpm_cand) - float(bpm_cur)), 2),
+                limit=controls.max_bpm_jump,
+                unit="bpm",
+            )
+
+    elif violation == "hard BPM compatibility":
+        if isinstance(bpm_cur, (int, float)) and isinstance(bpm_cand, (int, float)):
+            # mirror the gate arithmetic in _hard_fail exactly, including the
+            # vocal-halving of the stretch window
+            either_vocal = candidate.get("instrumental") is not True or (
+                cur.get("instrumental") is not True
+            )
+            anchor = float(bpm_cur)
+            actual_pct = abs(float(bpm_cand) - anchor) / anchor * 100.0 if anchor else None
+            limit_pct = _beat_stretch_limit_pct(controls, either_vocal)
+            row.update(
+                rule="bpm_delta",
+                actual=None if actual_pct is None else round(actual_pct, 2),
+                limit=round(limit_pct, 2),
+                unit="% of anchor bpm",
+            )
+            if either_vocal:
+                row["vocal_halved"] = True
+            if actual_pct is not None:
+                factor = 50.0 if either_vocal else 100.0
+                looser = next(
+                    (
+                        setting
+                        for setting in ("strict", "normal", "aggressive")
+                        if BEAT_STRETCH_LIMITS[setting] * factor >= actual_pct
+                    ),
+                    None,
+                )
+                # None means even aggressive cannot cover the gap: the honest
+                # suggestion becomes "swap tracks" (the FE renders that).
+                row["suggested_setting"] = "beatStrictness"
+                row["suggested_value"] = looser
+
+    elif violation in (
+        "key must match",
+        "incompatible key",
+        "hard key compatibility unavailable or failed",
+    ):
+        camelot_a, camelot_b = cur.get("camelot"), candidate.get("camelot")
+        if camelot_a and camelot_b:
+            # report the two Camelot codes plus the affinity value - the engine
+            # gates on camelot_affinity tiers, not Camelot steps
+            row.update(
+                rule="key_incompatible",
+                actual=camelot_affinity(camelot_a, camelot_b),
+                limit=1.0 if controls.key_relation == "same" else 0.0,
+                unit="camelot affinity",
+                detail=f"{camelot_a} -> {camelot_b}",
+            )
+
+    elif violation == "hard energy compatibility":
+        a, b = cur.get("energy"), candidate.get("energy")
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            row.update(
+                rule="energy_step",
+                actual=round(abs(float(a) - float(b)), 3),
+                limit=ENERGY_DELTA_LIMIT,
+                unit="energy (0-1)",
+            )
+
+    elif violation == "hard danceability compatibility":
+        a, b = cur.get("danceability"), candidate.get("danceability")
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            row.update(
+                rule="danceability_delta",
+                actual=round(abs(float(a) - float(b)), 3),
+                limit=DANCEABILITY_DELTA_LIMIT,
+                unit="danceability (0-1)",
+            )
+
+    elif violation == "hard loudness compatibility":
+        a, b = cur.get("loudness"), candidate.get("loudness")
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+            row.update(
+                rule="loudness_delta",
+                actual=round(abs(float(a) - float(b)), 3),
+                limit=LOUDNESS_DELTA_LIMIT,
+                unit="loudness",
+            )
+
+    elif violation == "hard genre compatibility":
+        a, b = cur.get("genre"), candidate.get("genre")
+        row.update(
+            rule="genre_mismatch",
+            actual=f"{a} -> {b}" if a and b else None,
+            limit="same genre",
+        )
+
+    elif violation == "hard artist spacing":
+        row.update(
+            rule="artist_spacing",
+            actual=artist_run_length,
+            limit=max(1, controls.max_artist_repeat),
+            unit="consecutive tracks",
+        )
+
+    elif violation == "below minimum BPM":
+        if isinstance(bpm_cand, (int, float)):
+            row.update(actual=round(float(bpm_cand), 2), limit=controls.bpm_min, unit="bpm")
+    elif violation == "above maximum BPM":
+        if isinstance(bpm_cand, (int, float)):
+            row.update(actual=round(float(bpm_cand), 2), limit=controls.bpm_max, unit="bpm")
+
+    return row
+
+
+def _violation_details(plan_or_candidate: dict[str, Any] | None) -> list[dict[str, Any]]:
+    """
+    Pure re-derivation of actual-vs-limit numbers for the insight panel.
+
+    Accepts the best-rejected capture record threaded out of ``beam_optimize``
+    (``current`` / ``candidate`` / ``controls`` / ``violations`` /
+    ``artist_run_length``) or None - a clean plan has no capture and yields an
+    empty list, so the panel only ever renders REAL failed rules with the REAL
+    gate numbers (shared constants + BEAT_STRETCH_LIMITS keep this in lockstep
+    with ``_hard_fail``). Rows carry {rule, actual, limit, unit,
+    suggested_setting, suggested_value}; informational rows (no derivable
+    numbers) keep the raw violation string as the rule with null numbers.
+    """
+    if not plan_or_candidate:
+        return []
+    current = plan_or_candidate.get("current")
+    candidate = plan_or_candidate.get("candidate")
+    controls = plan_or_candidate.get("controls")
+    if not isinstance(controls, DJControls):
+        controls = DJControls()
+    run_length = int(plan_or_candidate.get("artist_run_length") or 0)
+    cand = candidate if isinstance(candidate, dict) else {}
+    rows = [
+        _violation_row(str(violation), current, cand, controls, run_length)
+        for violation in (plan_or_candidate.get("violations") or [])
+    ]
+    rows.sort(key=_violation_severity, reverse=True)
+    return rows
