@@ -475,7 +475,23 @@ class StandardCrossFade(SmartFade):
         for pcm_slice in iter_pcm_slices(pre_crossfade, pcm_format, 1000):
             yield pcm_slice
         if duck_task is not None:
-            adjusted_fade_out_part = await duck_task
+            # bounded, fail-open: stems inference runs ~2.3x the overlap
+            # duration on 8 cores, and on a cache-cold first play the
+            # pre-crossfade tail covers none of it — an unbounded await here
+            # stalls the mix's first byte against a real-time player (the
+            # sweep-hang bug's playback twin). On timeout, ship the un-ducked
+            # bytes; a vocal overlap beats a silent one.
+            overlap_seconds = self.crossfade_size / pcm_format.pcm_sample_size
+            try:
+                adjusted_fade_out_part = await asyncio.wait_for(
+                    duck_task, timeout=max(overlap_seconds * 4.0, 15.0)
+                )
+            except TimeoutError:
+                self.logger.warning(
+                    "Stems duck timed out after %.1fs; shipping the un-ducked overlap",
+                    max(overlap_seconds * 4.0, 15.0),
+                )
+                adjusted_fade_out_part = fade_out_part[split:]
 
         if isinstance(fade_in_part, bytes):
             # aclosing so the mixer ffmpeg tears down here, not from a GC finalizer,

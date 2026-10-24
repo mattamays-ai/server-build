@@ -82,6 +82,10 @@ class DJControls:
     # double-vocal handoff. Soft: degrades to the plain blend when the
     # separation runtime/model is unavailable.
     stems_enabled: bool = False
+    # FE ships this as a per-request escape hatch past the threshold-derived
+    # vetoes (0.0.28 lane D); the server-side field was missing so the
+    # control silently did nothing (review finding, Oct 24)
+    stems_veto_override: bool = False
     # Energy-arc asymmetry (0.0.27, FLOATING user control): when True the
     # SCORING target becomes position-aware -- climbs are capped at ~1 tier
     # (halved during a segment's warm-up), drops of 2-3 tiers count as a

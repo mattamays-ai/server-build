@@ -164,6 +164,9 @@ class SmartCrossFadePlanner(TransitionPlanner):
             else:
                 plan = EmergencyHandoffFactory(ctx, factory, self.logger).build()
                 source = "emergency-handoff"
+            # factory-built plans skip finalize; the seam correction is the
+            # one part of it these ugliest-of-the-night boundaries still need
+            plan = PlanAssembler(ctx, self.logger).gain_match(plan)
             bars = None
             replaced_cut = None
         else:

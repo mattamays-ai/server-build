@@ -10,7 +10,7 @@ echo "== resolving Smart DJ add-on slug by name (repo-hash prefixes drift)"
 SLUG=$(curl -fsS -H "$AUTH" "$BASE/addons" 2>/dev/null \
   | grep -o '"slug": *"[^"]*_music_assistant_smartdj"' | head -1 | cut -d'"' -f4)
 if [ -z "$SLUG" ]; then
-  SLUG=$(curl -fsS -H "$AUTH" "$BASE/store/apps" 2>/dev/null \
+  SLUG=$(curl -fsS -H "$AUTH" "$BASE/store/addons" 2>/dev/null \
     | grep -o '"slug": *"[^"]*_music_assistant_smartdj"' | head -1 | cut -d'"' -f4)
 fi
 if [ -z "$SLUG" ]; then
@@ -54,12 +54,12 @@ fi
 echo "== installed? checking (proving presence via /addons, not /info emptiness)"
 if curl -fsS -H "$AUTH" "$BASE/addons" | grep -q "\"$SLUG\""; then
   echo "== installed -> updating in place (data preserved)"
-  curl -fsS -X POST -H "$AUTH" "$BASE/store/apps/$SLUG/update" >/dev/null \
-    && echo ok || echo "update failed (check version below)"
+  curl -fsS -X POST -H "$AUTH" "$BASE/store/addons/$SLUG/update" >/dev/null \
+    && echo ok || { echo "FATAL: update failed (check version below)"; exit 1; }
 else
   echo "== confirmed absent -> installing (fresh /data, onboarding wizard on first open)"
-  curl -fsS -X POST -H "$AUTH" "$BASE/store/apps/$SLUG/install" >/dev/null \
-    && echo ok || echo "install failed"
+  curl -fsS -X POST -H "$AUTH" "$BASE/store/addons/$SLUG/install" >/dev/null \
+    && echo ok || { echo "FATAL: install failed"; exit 1; }
 fi
 
 sleep 3

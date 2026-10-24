@@ -33,7 +33,7 @@ from typing import Any, Final
 
 # Bump when a derivation changes meaning; rows stamped with an older version
 # are treated as index misses (stale) and re-derived from the analysis store.
-INDEX_VERSION: Final[int] = 1
+INDEX_VERSION: Final[int] = 2
 
 INDEX_FILENAME: Final[str] = "quick_index.sqlite3"
 
@@ -680,6 +680,13 @@ class QuickIndex:
             conn.execute(_SCHEMA)
             for statement in _INDEXES:
                 conn.execute(statement)
+            # one-time purge of rows stamped by an older INDEX_VERSION: v1
+            # shipped before the tombstone gate, so pre-bump rows can carry
+            # all-null shells that count() and select() would keep serving
+            conn.execute(
+                "DELETE FROM track_index WHERE analyzer_version < ?",
+                (INDEX_VERSION,),
+            )
         self._opened = True
 
     def select(  # noqa: PLR0913 - the filter surface mirrors the command's

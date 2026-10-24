@@ -447,6 +447,30 @@ async def test_index_upsert_from_silent_success(tmp_path: Any) -> None:
     assert rows[("t9", "prov1")]["year"] == 2001
 
 
+async def test_index_upsert_refuses_a_tombstone(tmp_path: Any) -> None:
+    """
+    An all-null analysis must never reach the quick-pull index.
+
+    The acoustid no-match tombstone parses as a real AudioAnalysisData with
+    every scalar None; indexing it would stamp the CURRENT analyzer_version
+    on a row with nothing in it, which is what made total_indexed lie.
+    """
+    prov = _bare_prov(tmp_path)
+    tombstone = AudioAnalysisData(extra_data={"retry_after": 1234})
+    await prov._index_upsert("t9", "prov1", tombstone, None)
+    assert prov._quick_index.lookup([("t9", "prov1")]) == {}
+    assert prov._quick_index.count() == 0
+
+
+async def test_index_upsert_still_accepts_one_real_scalar(tmp_path: Any) -> None:
+    """A single populated measurement is enough to be worth indexing."""
+    prov = _bare_prov(tmp_path)
+    sparse = AudioAnalysisData(bpm=96.0)
+    await prov._index_upsert("t9", "prov1", sparse, None)
+    rows = prov._quick_index.lookup([("t9", "prov1")])
+    assert rows[("t9", "prov1")]["bpm"] == 96.0
+
+
 async def test_index_upsert_is_fail_soft(tmp_path: Any) -> None:
     """A broken index never turns a successful analysis into a failure."""
 

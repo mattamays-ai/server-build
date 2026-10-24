@@ -33,7 +33,10 @@ from music_assistant.constants import (
     DEFAULT_BACKGROUND_SCAN_CONCURRENCY,
 )
 from music_assistant.controllers.player_queues.helpers import build_queue_item
-from music_assistant.controllers.streams.audio_analysis import SONIC_ANALYSIS_DOMAIN
+from music_assistant.controllers.streams.audio_analysis import (
+    SONIC_ANALYSIS_DOMAIN,
+    has_real_analysis,
+)
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.controllers.streams.constants import BufferMode, BufferSize
 from music_assistant.controllers.streams.smart_fades import stems as stems_ducking
@@ -518,6 +521,7 @@ def _pair_style(
 def _stems_veto_reason(
     outgoing: dict[str, Any] | None,
     stems_enabled: bool,
+    veto_override: bool = False,
 ) -> str | None:
     """
     Decide whether the stems vocal-duck may run for one transition.
@@ -546,6 +550,10 @@ def _stems_veto_reason(
     """
     if not stems_enabled:
         return STEMS_VETO_DISABLED
+    if veto_override:
+        # the user's escape hatch past the threshold vetoes; the toggle
+        # itself stays the master switch (an override never forces stems ON)
+        return None
     if not stems_ducking.available():
         return STEMS_VETO_UNAVAILABLE
     if outgoing is None:
@@ -593,7 +601,7 @@ def _transition_report(
         camelot_a, camelot_b = cur.get("camelot"), cand.get("camelot")
         key_distance = camelot_affinity(camelot_a, camelot_b) if camelot_a and camelot_b else None
         resolved = _pair_style(cur, cand, control)
-        veto = _stems_veto_reason(current, control.stems_enabled)
+        veto = _stems_veto_reason(current, control.stems_enabled, control.stems_veto_override)
         # the user's per-track override (0 = hard cut) always wins over the
         # derivation (0.0.28 lane C contract)
         override = control.transition_bars_overrides.get(str(cand.get("queue_item_id")))
@@ -675,7 +683,7 @@ def _automix_stems_vetoes(
     for track in tracks:
         if track.get("queue_item_id") is None:
             continue
-        reason = _stems_veto_reason(outgoing, control.stems_enabled)
+        reason = _stems_veto_reason(outgoing, control.stems_enabled, control.stems_veto_override)
         if reason is not None and reason != STEMS_VETO_DISABLED:
             vetoes[str(track["queue_item_id"])] = reason
         outgoing = track
@@ -974,14 +982,21 @@ async def _playlist_analysis_rows(
         metadata = getattr(track, "metadata", None)
         genres = list(getattr(metadata, "genres", None) or [])
         mix_id = f"mix-{idx}"
+        # analysis keys resolve through provider mappings (review finding,
+        # Oct 24): a library playlist's rows used to carry provider="library",
+        # which no analysis store or index can answer - every row planned as
+        # "analysis unavailable" and the engine degraded to fixed barriers
+        targets = provider._analysis_targets_for_track(track)
+        a_item_id, a_provider = (
+            targets[0] if targets else (track.item_id, getattr(track, "provider", None))
+        )
         analysis_rows.append(
             {
                 "queue_item_id": mix_id,
                 "name": track.name,
                 "artist": getattr(track, "artist_str", None) or getattr(track, "artist", None),
-                "item_id": track.item_id,
-                "provider": getattr(track, "provider", None)
-                or getattr(track, "provider_instance", None),
+                "item_id": a_item_id,
+                "provider": a_provider,
                 "genre": genres[0] if genres else None,
                 "genres": genres,
                 "explicit": getattr(metadata, "explicit", None) if metadata else None,
@@ -1081,7 +1096,24 @@ class SmartDJProvider(PluginProvider):
             if len(prerolled) >= max(1, min(int(limit), 100)):
                 break
             try:
-                done = await self._preroll_track_analysis(item)
+                # the sweep's hard timeout, applied to the preroll path: a
+                # hung stream fetch here holds the same per-item
+                # _stream_details_locks entry the PLAYBACK path needs, so an
+                # unbounded preroll can stall a real transition
+                done = await asyncio.wait_for(
+                    self._preroll_track_analysis(item),
+                    timeout=ANALYSIS_ATTEMPT_TIMEOUT,
+                )
+            except TimeoutError:
+                self.logger.warning(
+                    "Smart DJ preroll timed out for %s after %ss",
+                    item.name,
+                    ANALYSIS_ATTEMPT_TIMEOUT,
+                )
+                failed[str(item.queue_item_id)] = (
+                    f"timeout after {ANALYSIS_ATTEMPT_TIMEOUT}s"
+                )
+                continue
             except Exception as err:
                 self.logger.debug("Smart DJ preroll failed for %s: %s", item.name, err)
                 failed[str(item.queue_item_id)] = str(err)
@@ -1163,12 +1195,30 @@ class SmartDJProvider(PluginProvider):
         if getattr(queue, "crossfade_enabled", False):
             automix_pinned = len(queue_items)
             self.mass.create_task(self.preroll_queue_analysis(queue_id, len(queue_items)))
+        # _transition_report reads every element with .get(); the appended
+        # tracks here are live media objects (not snapshot dicts), so flatten
+        # them into the same row shape the other call sites feed. Without this
+        # the report raised AttributeError AFTER the queue was already mutated
+        # and the preroll fired, so the FE saw "Complete mix failed" while the
+        # music had in fact changed.
+        report_rows = [
+            seed,
+            *(
+                {
+                    "name": track.name,
+                    "artist": getattr(track, "artist_str", None) or getattr(track, "artist", None),
+                    "queue_item_id": queue_item.queue_item_id,
+                    "analysis": None,
+                }
+                for track, queue_item in zip(tracks, queue_items, strict=True)
+            ),
+        ]
         return {
             "queue_id": queue_id,
             "seed": seed.get("name"),
             "added": [track.name for track in tracks],
             "automix_pinned": automix_pinned,
-            "transition_notes": _transition_report([seed, *tracks], control),
+            "transition_notes": _transition_report(report_rows, control),
         }
 
     async def analyze_library(
@@ -1209,11 +1259,15 @@ class SmartDJProvider(PluginProvider):
         now = time.time()
         for track in tracks:
             key = None
-            if track.provider:
-                candidate = f"{track.provider}:{track.item_id}"
+            # resolve through provider mappings (review finding, Oct 24):
+            # library tracks' own ids produced `library:` cache keys nothing
+            # ever reads - up to 500 wasted Musicae requests per run
+            for a_item_id, a_instance in self._analysis_targets_for_track(track):
+                candidate = f"{a_instance}:{a_item_id}"
                 cached = self._cache.get(candidate)
                 if not (cached and now - cached[0] < CACHE_TTL):
-                    key = (candidate, track.item_id)
+                    key = (candidate, a_item_id)
+                    break
             if key is None:
                 isrc = track.get_external_id(ExternalID.ISRC)
                 if isrc:
@@ -1342,7 +1396,8 @@ class SmartDJProvider(PluginProvider):
     async def mix_tracks(
         self,
         queue_id: str,
-        track_uris: list[str],
+        track_uris: list[str] | None = None,
+        uris: list[str] | None = None,
         bpm_tolerance: float = 0.08,
         prefer_keys: bool = True,
         preserve_variety: bool = True,
@@ -1363,11 +1418,14 @@ class SmartDJProvider(PluginProvider):
         analysis_provider = str(raw.get("analysis_provider", "auto"))
         pool_source = str(raw.get("pool_source", "auto"))
         control = self._parse_controls(raw, bpm_tolerance, prefer_keys, preserve_variety, mode)
-        uris = [str(uri) for uri in (track_uris or [])]
-        resolved, unresolved = await self._resolve_track_uris(uris)
+        # `uris` is accepted as an alias: the FE's mixSelection shipped the
+        # payload key `uris` against this method's `track_uris` (review
+        # finding, Oct 24) and every such call failed on binding
+        payload = [str(uri) for uri in (track_uris or uris or [])]
+        resolved, unresolved = await self._resolve_track_uris(payload)
         if len(resolved) < 2:
             raise RuntimeError(
-                f"Need at least 2 resolvable tracks to mix ({len(resolved)} of {len(uris)} URIs)"
+                f"Need at least 2 resolvable tracks to mix ({len(resolved)} of {len(payload)} URIs)"
             )
         return await self._mix_resolved(
             queue_id=queue_id,
@@ -1377,7 +1435,7 @@ class SmartDJProvider(PluginProvider):
             bpm_tolerance=bpm_tolerance,
             analysis_provider=analysis_provider,
             pool_source=pool_source,
-            response_base={"track_uris": len(uris), "unresolved_uris": unresolved},
+            response_base={"track_uris": len(payload), "unresolved_uris": unresolved},
         )
 
     async def rank_queue(  # noqa: PLR0915 - linear pipeline by design
@@ -1463,13 +1521,57 @@ class SmartDJProvider(PluginProvider):
             selected_mode.variety,
             selected_mode.weights,
         )
-        optimized = beam_optimize(
-            tracks[1:],
-            _merge_track(tracks[0]) if tracks else snapshot["current"],
-            selected_mode,
-            controls=control,
-            beam_width=max(4, min(96, control.lookahead * 3)),
-        )
+        try:
+            optimized = beam_optimize(
+                tracks[1:],
+                _merge_track(tracks[0]) if tracks else snapshot["current"],
+                selected_mode,
+                controls=control,
+                beam_width=max(4, min(96, control.lookahead * 3)),
+            )
+        except HardRequirementsImpossible as err:
+            # fail-soft plan contract (review finding, Oct 24): the FE's
+            # plan() branches on plan_failed/hard_violations, which this
+            # command never emitted - the insight panel waited on a shape
+            # that did not exist. Rows are mapped into the FE's
+            # HardViolation interface (suggestion.setting/.to).
+            return {
+                "queue_id": queue_id,
+                "current_item_id": tracks[0]["queue_item_id"],
+                "tracks": tracks[1:],
+                "optimized_window": len(tracks) - 1,
+                "queue_item_count": snapshot.get("queue_item_count"),
+                "applied": False,
+                "queue_changed": False,
+                "automix_applied": False,
+                "automix": None,
+                "plan_failed": True,
+                "hard_violations": [
+                    {
+                        "rule": row.get("rule"),
+                        "message": None,
+                        "actual": row.get("actual"),
+                        "limit": row.get("limit"),
+                        "unit": row.get("unit"),
+                        "overshoot": None,
+                        "severity": None,
+                        "suggestion": (
+                            {
+                                "setting": row.get("suggested_setting"),
+                                "label": None,
+                                "from": None,
+                                "to": row.get("suggested_value"),
+                            }
+                            if row.get("suggested_setting")
+                            else None
+                        ),
+                    }
+                    for row in (err.details or [])
+                ],
+                "candidates_rejected": 0,
+                "reason": "hard_requirements_impossible",
+                "settings": {"controls": raw, "mode": mode},
+            }
         if not optimized and tracks[1:]:
             raise RuntimeError("Hard requirements are impossible with the current queue")
 
@@ -2056,7 +2158,9 @@ class SmartDJProvider(PluginProvider):
                     item_id=a_item_id,
                     provider_instance_id_or_domain=a_instance,
                 )
-                if existing is not None:
+                # has_real_analysis, not `is not None`: acoustid no-match rows are
+                # all-null tombstones that would otherwise count as analyzed.
+                if has_real_analysis(existing):
                     found = True
                     break
             if not found:
@@ -2525,7 +2629,8 @@ class SmartDJProvider(PluginProvider):
             item_id=media_item_id,
             provider_instance_id_or_domain=media_provider,
         )
-        if existing is not None:
+        # see has_real_analysis: a tombstone must not satisfy the preroll gate
+        if has_real_analysis(existing):
             return False
         streamdetails = await self.mass.streams.audio.get_stream_details(queue_item)
         if streamdetails.is_realtime:
@@ -2546,7 +2651,7 @@ class SmartDJProvider(PluginProvider):
                     item_id=media_item_id,
                     provider_instance_id_or_domain=media_provider,
                 )
-                if stored is not None:
+                if has_real_analysis(stored):
                     # same derived-index upsert as _analyze_media_silent's
                     # success point: preroll-stored analysis must reach the
                     # quick-pull index too, or pull_candidates would miss
@@ -2700,6 +2805,7 @@ class SmartDJProvider(PluginProvider):
             automix_enabled=bool(raw.get("automix_enabled", False)),
             smart_reorder_enabled=bool(raw.get("smart_reorder_enabled", True)),
             stems_enabled=bool(raw.get("stems_enabled", False)),
+            stems_veto_override=bool(raw.get("stems_veto_override", False)),
             energy_arc=bool(raw.get("energy_arc", False)),
             transition_style=transition_style,
             beat_strictness=beat_strictness,
@@ -2935,7 +3041,10 @@ class SmartDJProvider(PluginProvider):
                     item_id=item_id,
                     provider_instance_id_or_domain=provider,
                 )
-                if analysis is not None:
+                # has_real_analysis, not `is not None`: an all-null
+                # tombstone must not surface as a phantom "analyzed" dict
+                # the planner treats as real
+                if analysis is not None and has_real_analysis(analysis):
                     return {
                         "bpm": analysis.bpm,
                         "key": analysis.key,
@@ -3383,7 +3492,8 @@ class SmartDJProvider(PluginProvider):
             item_id=item_id,
             provider_instance_id_or_domain=provider_id,
         )
-        if existing is not None:
+        # see has_real_analysis: tombstones must not block the sweep dispatch
+        if has_real_analysis(existing):
             return False
         music_prov = self.mass.get_provider(provider_id, provider_type=MusicProvider)
         if music_prov is None or not music_prov.available:
@@ -3407,7 +3517,7 @@ class SmartDJProvider(PluginProvider):
                     item_id=item_id,
                     provider_instance_id_or_domain=provider_id,
                 )
-                if stored is not None:
+                if has_real_analysis(stored):
                     # success point (spec 3.2): fold the freshly stored
                     # analysis into the derived quick-pull index while the
                     # AudioAnalysisData is in hand; fail-soft, never a
@@ -3428,7 +3538,21 @@ class SmartDJProvider(PluginProvider):
 
         The index may never break the analysis that feeds it: any failure
         here is logged and dropped - the next backfill re-derives the row.
+
+        An all-null analysis (an acoustid no-match tombstone, see
+        has_real_analysis) is refused here: the row would carry a current
+        analyzer_version with every scalar NULL, which is indistinguishable
+        from a real derived row and would keep total_indexed dishonest. The
+        gate lives in this one place so every call site - the sweep success
+        poll, the preroll poll and the backfill - is covered.
         """
+        if not has_real_analysis(analysis):
+            self.logger.debug(
+                "Quick-pull index upsert skipped for %s: analysis carries no "
+                "real measurement (acoustid tombstone or empty row)",
+                item_id,
+            )
+            return
         try:
             metadata = getattr(track, "metadata", None)
             row = derive_row(item_id, provider_id, analysis, metadata)

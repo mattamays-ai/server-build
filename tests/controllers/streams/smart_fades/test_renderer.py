@@ -222,7 +222,10 @@ class TestDressedRendering:
         assert timing.pre_crossfade_duration == pytest.approx(32.0)
         blend = filters[-1]
         assert isinstance(blend, StreamingCrossfadeFilter)
-        assert blend.limit_db is None
+        # 0.0.29: every summed blend gets the peak ceiling — amix with
+        # normalize=0 sums both decks at full level, so plain crossfades
+        # of loud masters can clip exactly like echo-outs
+        assert blend.limit_db == -0.5
 
     def test_echo_out_renders_on_the_outgoing_side(self) -> None:
         """The echo cuts the outgoing stream at its cut, ahead of the blend that starts there."""

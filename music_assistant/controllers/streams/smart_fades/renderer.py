@@ -168,7 +168,10 @@ class TransitionRenderer:
                 pre_crossfade_samples=pre_crossfade_samples,
                 fadeout_curve=plan.fadeout_curve,
                 fadein_curve=plan.fadein_curve,
-                limit_db=MIX_CEILING_DB if plan.echo is not None else None,
+                # every summed blend gets the ceiling: amix with normalize=0
+                # sums BOTH decks at full level, so a plain crossfade of two
+                # loud masters can clip exactly like an echo out
+                limit_db=MIX_CEILING_DB,
             )
         )
         return filters

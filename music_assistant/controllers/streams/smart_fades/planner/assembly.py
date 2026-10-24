@@ -154,6 +154,16 @@ class PlanAssembler:
         # the winner's metrics ride along: consumers read them off the plan
         return replace(plan, eq_plan=self._choose_eq(plan), metrics=candidate.metrics)
 
+    def gain_match(self, plan: TransitionPlan) -> TransitionPlan:
+        """Fold the loudness-step correction into a factory-built plan.
+
+        Fallback-crossfade and emergency-handoff plans skip ``finalize``
+        (no EQ assembly to stage), but the seam-level correction is exactly
+        as valid on them; ``_gain_match_db`` still refuses styles and shapes
+        (radio, zero-length overlap, missing analysis) it cannot serve.
+        """
+        return replace(plan, gain_match_db=self._gain_match_db(plan))
+
     def _choose_eq(self, plan: TransitionPlan) -> EqPlan:
         """Plan the low/mid/high EQ handover, centered on the swap point."""
         # an unsynced cut, dressed or not, has no beatmatched handover to stage:

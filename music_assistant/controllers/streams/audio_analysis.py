@@ -202,6 +202,29 @@ def _merged_from_rows(
     return merged if found else None
 
 
+def has_real_analysis(analysis: AudioAnalysisData | None) -> bool:
+    """
+    Return True only when a merged analysis carries at least one real measurement.
+
+    A no-match row (e.g. acoustid_lookup's fingerprint miss) persists an
+    AudioAnalysisData whose every field is None apart from bookkeeping in
+    ``extra_data`` (``retry_after``). ``_merged_from_rows`` still returns that
+    object, so a bare ``is not None`` check treats a tombstone as a completed
+    analysis and skips the track forever. Gate on this instead.
+
+    :param analysis: Merged analysis from ``get_audio_analysis`` (or None).
+    """
+    if analysis is None:
+        return False
+    for fld in dataclasses.fields(analysis):
+        if fld.name == "extra_data":
+            continue
+        value = getattr(analysis, fld.name)
+        if value is not None:
+            return True
+    return False
+
+
 def _first_non_finite_field(analysis: AudioAnalysisData) -> str | None:
     """Return the name of the first float field holding a non-finite value, if any."""
     for fld in dataclasses.fields(analysis):

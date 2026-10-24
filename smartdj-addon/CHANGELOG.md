@@ -1,3 +1,42 @@
+## 0.0.29
+
+- **Fixed: Complete-mix crash** — the mix completed and changed the queue, then
+  the transition report crashed on live Track objects and the FE toasted
+  "Complete mix failed" anyway.
+- **Fixed: tombstone analyses lied about the library** — acoustid no-match
+  rows (all fields null) counted as "analyzed", permanently blocked re-analysis,
+  and were served to the planner. The remaining read paths (both analysis
+  success-polls, the planner's analysis lookup) now require a real measurement,
+  and the derived index is version-bumped with a one-time purge of the
+  all-null rows, so the analyzed counter tells the truth again.
+- **Fixed: stems duck could stall the music mid-transition** — the duck's
+  model inference was awaited without a timeout on cache-cold first plays; it
+  is now bounded (fail-open to the un-ducked overlap, loudly logged).
+- **Fixed: Mix Selection never worked** — the FE sent `uris` where the server
+  takes `track_uris`; the server now accepts both.
+- **Fixed: menu-invoked AutoMix ignored saved stems/arc/veto preferences** —
+  ui.js's saved-preferences map now carries stemsEnabled, energyArc and
+  stemsVetoOverride.
+- **Fixed: stems-veto override did nothing server-side** — the control is now
+  parsed and honored (the toggle stays the master switch).
+- **Fixed: gain match on fallback-crossfade and emergency-handoff** — the
+  ugliest boundaries of the night now get the same loudness correction as the
+  smart blends.
+- **Fixed: plain crossfades run un-limited** — every summed blend now gets the
+  -0.5 dB peak ceiling, not just echo-outs.
+- **Fixed: preroll analysis hangs** — the preroll path gets the sweep's 45s
+  hard timeout (a hung fetch there also held the lock real playback needs).
+- **Fixed: library playlists mixed with zero analysis** — mix/sort on library
+  playlists now resolves analysis through each track's provider mappings
+  instead of the un-answerable "library" pseudo-provider id.
+- **Fixed: analyze_library burned quota on ids nothing reads** — batch
+  enrichment now resolves Musicae ids through provider mappings.
+- **Fixed: hard-requirements panel on plan previews** — rank_queue now returns
+  the fail-soft plan_failed/violations shape the FE has been waiting on.
+- **Fixed: update-smartdj.sh used dead Supervisor endpoints and swallowed
+  failures** — endpoints aligned with the installer, failures are fatal, and
+  the CI guard now covers both scripts.
+
 ## 0.0.28
 
 - **Fixed: the silent 600-second sweep hang** — per-track analysis attempts now

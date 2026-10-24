@@ -5,6 +5,7 @@ on:
     branches: ["dev"]
     paths:
       - "install-smartdj-ma.sh"
+      - "update-smartdj.sh"
       - "smartdj-addon/**"
       - "docker/smartdj.Dockerfile"
       - "music_assistant/providers/smart_dj/**"
@@ -15,6 +16,7 @@ on:
     branches: ["dev"]
     paths:
       - "install-smartdj-ma.sh"
+      - "update-smartdj.sh"
       - "smartdj-addon/**"
       - "docker/smartdj.Dockerfile"
       - "music_assistant/providers/smart_dj/**"
@@ -43,10 +45,15 @@ jobs:
           set -euo pipefail
           grep -Fq 'store=$(api GET "/store/addons")' install-smartdj-ma.sh
           grep -Fq 'api POST "/store/addons/$SLUG/install"' install-smartdj-ma.sh
-          if grep -Eq '"/store/apps' install-smartdj-ma.sh; then
-            echo "::error::Installer contains the invalid /store/apps endpoint."
-            exit 1
-          fi
+          # BOTH supervisor-touching scripts are guarded; they drifted once
+          # (update-smartdj.sh kept /store/apps after the installer fix)
+          for script in install-smartdj-ma.sh update-smartdj.sh; do
+            sh -n "$script"
+            if grep -Eq '"/store/apps' "$script"; then
+              echo "::error::$script contains the invalid /store/apps endpoint."
+              exit 1
+            fi
+          done
 
       - name: Validate app metadata and image architecture
         shell: bash

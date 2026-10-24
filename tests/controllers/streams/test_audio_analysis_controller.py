@@ -13,6 +13,7 @@ from music_assistant_models.media_items import AudioFormat
 from music_assistant.controllers.streams.audio_analysis import (
     REALTIME_ANALYSIS_MAX_SESSIONS,
     AudioAnalysisController,
+    has_real_analysis,
 )
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer, AudioBufferDiscarded
 from music_assistant.controllers.streams.smart_fades.vocal import (
@@ -717,3 +718,31 @@ async def test_get_vocal_onset_reads_the_stored_vocal_timeline(
 
     assert onset is not None
     assert onset == first_vocal_onset(analysis)
+
+
+def test_has_real_analysis_rejects_tombstones() -> None:
+    """
+    A no-match row must not count as analyzed.
+
+    acoustid_lookup persists an all-None AudioAnalysisData (bookkeeping only in
+    extra_data) for a fingerprint it cannot match. Smart DJ's gates used to accept
+    that object on `is not None`, so the track was skipped forever and the
+    sonic_analysis provider never ran for it.
+    """
+    tombstone = AudioAnalysisData(extra_data={"retry_after": 1792377876})
+    assert has_real_analysis(tombstone) is False
+
+
+def test_has_real_analysis_accepts_a_real_measurement() -> None:
+    """Any real scalar (here bpm/key/energy) marks the row as analyzed."""
+    assert has_real_analysis(AudioAnalysisData(bpm=128.0, key="A", mode="minor")) is True
+    assert has_real_analysis(AudioAnalysisData(energy=0.71)) is True
+    # a list field alone also counts: some providers store only envelopes
+    assert has_real_analysis(AudioAnalysisData(beats=[0.5, 1.0])) is True
+
+
+def test_has_real_analysis_rejects_none_and_bookkeeping_only() -> None:
+    """No analysis at all, or extra_data-only payloads, are not analyzed."""
+    assert has_real_analysis(None) is False
+    assert has_real_analysis(AudioAnalysisData()) is False
+    assert has_real_analysis(AudioAnalysisData(extra_data={"foo": 1})) is False
