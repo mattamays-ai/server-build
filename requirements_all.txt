@@ -13,9 +13,9 @@ aiohttp-socks==0.12.0
 aiojellyfin==0.14.1
 aiolibdatachannel @ git+https://github.com/music-assistant/aiolibdatachannel@feat/certpem-testdrive
 aiomusiccast==0.15.0
-aiosendspin[server]==10.0.1
-aioslimproto==3.2.3
-aiosonos==0.1.14
+aiosendspin[server]==10.2.1
+aioslimproto==3.3.0
+aiosonos==0.1.15
 aiosqlite==0.22.1
 aiosxm==0.3.0
 aiovban==1.1.0
@@ -39,7 +39,7 @@ duration-parser==1.0.1
 fastmcp==4.1.0
 getmac==0.9.6
 gql[all]==4.0.0
-hass-client==1.4.0
+hass-client==1.4.1
 hassfeld==0.3.14
 hue-entertainment==0.1.2
 huggingface-hub==1.30.0
