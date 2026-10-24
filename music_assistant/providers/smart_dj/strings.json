@@ -2,6 +2,10 @@
   "config_entries": {
     "rapidapi_key": {
       "label": "RapidAPI key"
+    },
+    "preanalysis_enabled": {
+      "label": "Pre-analyze new library tracks",
+      "description": "Analyze newly added library tracks in the background, using the same machinery and safeguards as the library sweep."
     }
   }
 }

@@ -1739,10 +1739,6 @@ class SmartDJProvider(PluginProvider):
                 default_value=True,
                 required=False,
                 requires_reload=False,
-                description=(
-                    "Analyze newly added library tracks in the background, using "
-                    "the same machinery and safeguards as the library sweep."
-                ),
             ),
         )
 
