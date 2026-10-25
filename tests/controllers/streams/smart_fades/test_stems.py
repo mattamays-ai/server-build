@@ -27,13 +27,13 @@ RNG = np.random.default_rng(20250101)
 def test_pcm16_decode_known_values() -> None:
     """16-bit LE interleaved PCM decodes to exactly v / 32768, deinterleaved."""
     pcm = np.array([1000, -2000, 32767, -32768, 0, 5], dtype="<i2").tobytes()
-    out = pcm_bytes_to_numpy(pcm, 44100, 16, 2)
+    out = pcm_bytes_to_numpy(pcm, 16, 2)
     assert out is not None
     assert out.dtype == np.float32
     assert out.shape == (2, 3)
-    expected = (
-        np.array([[1000, 32767, 0], [-2000, -32768, 5]], dtype=np.int64) / 32768.0
-    ).astype(np.float32)
+    expected = (np.array([[1000, 32767, 0], [-2000, -32768, 5]], dtype=np.int64) / 32768.0).astype(
+        np.float32
+    )
     # every v / 2**15 is exactly representable in float32
     np.testing.assert_array_equal(out, expected)
 
@@ -53,16 +53,18 @@ def test_pcm16_roundtrip_within_1_lsb() -> None:
     """Bytes -> float -> bytes stays within one LSB over a large random sample."""
     values = RNG.integers(-32768, 32768, size=100000, dtype=np.int32)
     pcm = values.astype("<i2").tobytes()
-    out = pcm_bytes_to_numpy(pcm, 44100, 16, 2)
+    out = pcm_bytes_to_numpy(pcm, 16, 2)
     assert out is not None
-    back = np.frombuffer(numpy_to_pcm_bytes(out, 16, 2), dtype="<i2").astype(np.int64)
+    encoded = numpy_to_pcm_bytes(out, 16, 2)
+    assert encoded is not None
+    back = np.frombuffer(encoded, dtype="<i2").astype(np.int64)
     assert np.abs(back - values).max() <= 1
 
 
 def test_pcm16_roundtrip_exact_for_zero() -> None:
     """An all-zero 16-bit buffer round-trips to byte-identical output."""
     pcm = np.zeros(4800, dtype="<i2").tobytes()
-    out = pcm_bytes_to_numpy(pcm, 44100, 16, 2)
+    out = pcm_bytes_to_numpy(pcm, 16, 2)
     assert out is not None
     assert numpy_to_pcm_bytes(out, 16, 2) == pcm
 
@@ -71,12 +73,12 @@ def test_pcm32_roundtrip_exact() -> None:
     """32-bit PCM round-trips to byte-identical output for safe-range values."""
     values = RNG.integers(-(1 << 23), 1 << 23, size=100000, dtype=np.int64)
     pcm = values.astype("<i4").tobytes()
-    out = pcm_bytes_to_numpy(pcm, 44100, 32, 2)
+    out = pcm_bytes_to_numpy(pcm, 32, 2)
     assert out is not None
     assert numpy_to_pcm_bytes(out, 32, 2) == pcm
     # and the decode of known bytes is exact
     known = np.array([100000, -200000, 4096, -4096], dtype="<i4").tobytes()
-    decoded = pcm_bytes_to_numpy(known, 44100, 32, 2)
+    decoded = pcm_bytes_to_numpy(known, 32, 2)
     assert decoded is not None
     np.testing.assert_array_equal(
         decoded,
@@ -104,7 +106,7 @@ def test_pcm24_decode_known_triples() -> None:
             0x7F,  # +8388607 (full scale positive)
         ]
     )
-    out = pcm_bytes_to_numpy(pcm, 44100, 24, 2)
+    out = pcm_bytes_to_numpy(pcm, 24, 2)
     assert out is not None
     assert out.dtype == np.float32
     assert out.shape == (2, 2)
@@ -116,8 +118,8 @@ def test_pcm24_decode_known_triples() -> None:
 
 def test_pcm_bridge_rejects_unsupported() -> None:
     """Non-stereo or unknown bit depths return None on both sides."""
-    assert pcm_bytes_to_numpy(b"\x00" * 8, 44100, 16, 1) is None
-    assert pcm_bytes_to_numpy(b"\x00" * 8, 44100, 8, 2) is None
+    assert pcm_bytes_to_numpy(b"\x00" * 8, 16, 1) is None
+    assert pcm_bytes_to_numpy(b"\x00" * 8, 8, 2) is None
     wave = np.zeros((2, 4), dtype=np.float32)
     assert numpy_to_pcm_bytes(wave, 16, 1) is None
     assert numpy_to_pcm_bytes(wave, 17, 2) is None
@@ -127,12 +129,14 @@ def test_pcm_bridge_rejects_unsupported() -> None:
 
 
 def test_resample_identity_when_rates_equal() -> None:
+    """Equal input and output rates must return the wave untouched."""
     wave = RNG.standard_normal((2, 4096)).astype(np.float32)
     out = resample_linear(wave, 48000, 48000)
     assert out is wave or np.array_equal(out, wave)
 
 
 def test_resample_44100_to_48000_length() -> None:
+    """Upsampling 44100 to 48000 yields exactly 48000 frames."""
     wave = RNG.standard_normal((2, 44100)).astype(np.float32)
     out = resample_linear(wave, 44100, 48000)
     assert out.shape == (2, 48000)
@@ -140,6 +144,7 @@ def test_resample_44100_to_48000_length() -> None:
 
 
 def test_resample_zero_stays_zero() -> None:
+    """A silent wave stays silent through the resampler."""
     n_out = max(1, round(1000 * 48000 / 44100))
     out = resample_linear(np.zeros((2, 1000), dtype=np.float32), 44100, 48000)
     assert out.shape == (2, n_out)
@@ -160,6 +165,7 @@ def test_duck_pcm_bytes_identity_without_model() -> None:
 
 
 def test_duck_db_for_mask_synthetic() -> None:
+    """duck_db_for_mask maps fully-open masks to 0 dB and full-vocal masks to the depth."""
     zeros = np.zeros((2, 512), dtype=np.float32)
     ones = np.ones((2, 512), dtype=np.float32)
     half = np.full((2, 512), 0.5, dtype=np.float32)
@@ -174,11 +180,13 @@ def test_duck_db_for_mask_synthetic() -> None:
 
 
 def test_blendprefs_stems_default_false() -> None:
+    """BlendPrefs.stems defaults to False."""
     prefs = BlendPrefs()
     assert prefs.stems is False
 
 
 def test_blendprefs_is_frozen() -> None:
+    """BlendPrefs is a frozen dataclass and rejects attribute assignment."""
     prefs = BlendPrefs()
     with pytest.raises(dataclasses.FrozenInstanceError):
         prefs.stems = True  # type: ignore[misc]
@@ -189,10 +197,10 @@ def test_blendprefs_is_frozen() -> None:
 
 def test_get_mask_shape_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     """With a stubbed session/window the mask matches the rfft bin layout, 0..1."""
-    monkeypatch.setattr(StemSeparator, "_get_session", lambda self: object())
+    monkeypatch.setattr(StemSeparator, "_get_session", lambda _self: object())
     # synthetic "vocal estimate": the mix itself, scaled down by half
     monkeypatch.setattr(
-        StemSeparator, "_run_window", lambda self, session, wave: (wave * 0.5).astype(np.float32)
+        StemSeparator, "_run_window", lambda _self, _session, wave: (wave * 0.5).astype(np.float32)
     )
     separator = StemSeparator()
     mix = RNG.standard_normal((2, 4096)).astype(np.float32)
@@ -203,6 +211,7 @@ def test_get_mask_shape_and_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     assert mask.dtype == np.float32
     assert mask.min() >= 0.0
     assert mask.max() <= 1.0
+
 
 # --- per-transition veto floor (0.0.28 lane D) -----------------------------------
 

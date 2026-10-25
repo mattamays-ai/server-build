@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
@@ -308,7 +309,7 @@ def test_select_rejects_bad_filters(tmp_path: Any) -> None:
     ]
     for kwargs, match in cases:
         with pytest.raises(ValueError, match=match):
-            index.select(**kwargs)
+            index.select(**cast("dict[str, Any]", kwargs))
 
 
 def test_select_validates_at_command_layer() -> None:
@@ -332,16 +333,16 @@ def _bare_prov(tmp_path: Any) -> SmartDJProvider:
     prov.logger = logging.getLogger("smart_dj_test")
     prov._quick_index = QuickIndex(tmp_path / "qi.sqlite3")
     prov._quick_index.open()
-    prov._analysis_calls: list[str] = []
+    prov._analysis_calls = []  # type: ignore[attr-defined]
 
     async def _spy_analysis(
         item_id: str, _provider: str, _metadata: Any, _ap: str
     ) -> dict[str, Any]:
-        prov._analysis_calls.append(str(item_id))
+        prov._analysis_calls.append(str(item_id))  # type: ignore[attr-defined]
         return {"bpm": 111.0, "source": "full", "camelot": "5A"}
 
-    prov._analysis = _spy_analysis  # type: ignore[method-assign]
-    return cast("SmartDJProvider", prov)
+    prov._analysis = _spy_analysis  # type: ignore[method-assign, assignment]
+    return prov
 
 
 def _pool_rows(count: int) -> list[dict[str, Any]]:
@@ -365,7 +366,7 @@ async def test_pool_prefers_index(tmp_path: Any) -> None:
     assert results[0]["source"] == "quick_index"
     assert results[0]["bpm"] == 128.0
     assert results[1]["source"] == "full"
-    assert prov._analysis_calls == ["id1"]
+    assert getattr(prov, "_analysis_calls") == ["id1"]  # noqa: B009
 
 
 async def test_pool_falls_back_when_index_empty(tmp_path: Any) -> None:
@@ -373,7 +374,7 @@ async def test_pool_falls_back_when_index_empty(tmp_path: Any) -> None:
     prov = _bare_prov(tmp_path)
     results = await prov._pool_analyses(_pool_rows(2), "auto")
     assert all(res["source"] == "full" for res in results)
-    assert prov._analysis_calls == ["id0", "id1"]
+    assert getattr(prov, "_analysis_calls") == ["id0", "id1"]  # noqa: B009
 
 
 async def test_pool_full_source_forces_payload_path(tmp_path: Any) -> None:
@@ -382,7 +383,7 @@ async def test_pool_full_source_forces_payload_path(tmp_path: Any) -> None:
     prov._quick_index.upsert(derive_row("id0", "prov1", _analysis_values()))
     results = await prov._pool_analyses(_pool_rows(2), "auto", pool_source="full")
     assert all(res["source"] == "full" for res in results)
-    assert prov._analysis_calls == ["id0", "id1"]
+    assert getattr(prov, "_analysis_calls") == ["id0", "id1"]  # noqa: B009
 
 
 async def test_pool_survives_broken_index(tmp_path: Any) -> None:
@@ -405,7 +406,7 @@ async def test_pool_keeps_exception_contract(tmp_path: Any) -> None:
         raise RuntimeError("no analysis for you")
 
     prov = _bare_prov(tmp_path)
-    prov._analysis = _boom  # type: ignore[method-assign]
+    prov._analysis = _boom  # type: ignore[method-assign, assignment]
     results = await prov._pool_analyses(_pool_rows(1), "auto")
     assert isinstance(results[0], RuntimeError)
 
@@ -504,7 +505,9 @@ async def test_backfill_derives_missing_rows(tmp_path: Any) -> None:
     prov = _bare_prov(tmp_path)
     analyzed_values = _analysis_values()
 
-    async def _iter_rows(_domain: str, _media_type: Any = None, **_kwargs: Any):
+    async def _iter_rows(
+        _domain: str, _media_type: Any = None, **_kwargs: Any
+    ) -> AsyncIterator[tuple[str, str, Any]]:
         yield ("t1", "prov1", analyzed_values)
         yield ("t2", "prov1", analyzed_values)
 
@@ -527,7 +530,9 @@ async def test_backfill_derives_missing_rows(tmp_path: Any) -> None:
 async def test_backfill_survives_empty_feed(tmp_path: Any) -> None:
     """An offline analysis domain yields nothing; backfill stays green."""
 
-    async def _iter_rows(_domain: str, _media_type: Any = None, **_kwargs: Any):
+    async def _iter_rows(
+        _domain: str, _media_type: Any = None, **_kwargs: Any
+    ) -> AsyncIterator[tuple[str, str, Any]]:
         return
         yield  # pragma: no cover - makes this an async generator
 
@@ -578,7 +583,7 @@ async def test_pull_candidates_rejects_bad_filters(tmp_path: Any) -> None:
     """Malformed filters raise the named invalid_control error."""
     prov = _bare_prov(tmp_path)
     with pytest.raises(SmartDJError, match="invalid_control"):
-        await prov.pull_candidates(bpm="fast")
+        await prov.pull_candidates(bpm="fast")  # type: ignore[arg-type]
     with pytest.raises(SmartDJError, match="invalid_control"):
         await prov.pull_candidates(key="not-a-key")
 

@@ -119,7 +119,7 @@ async def test_sweep_defers_to_active_playback() -> None:
         assert live["deferring"] is True
         assert live["analyzed"] == 0
         # playback stops -> the sweep proceeds
-        prov.mass.players = [_player(PlaybackState.IDLE)]
+        prov.mass.players = [_player(PlaybackState.IDLE)]  # type: ignore[assignment]
         final = await _finished(prov)
     finally:
         provider_module.LIBRARY_SCAN_POLL_SECONDS = monkeypatch_poll

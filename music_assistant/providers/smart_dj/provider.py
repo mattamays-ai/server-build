@@ -39,7 +39,6 @@ from music_assistant.controllers.streams.audio_analysis import (
 )
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
 from music_assistant.controllers.streams.constants import BufferMode, BufferSize
-from music_assistant.controllers.streams.smart_fades import stems as stems_ducking
 from music_assistant.helpers.app_vars import app_var
 from music_assistant.helpers.audio import decoded_pcm_format
 from music_assistant.models.music_provider import MusicProvider
@@ -554,6 +553,13 @@ def _stems_veto_reason(
         # the user's escape hatch past the threshold vetoes; the toggle
         # itself stays the master switch (an override never forces stems ON)
         return None
+    # Imported here, not at module scope: stems.py pulls in numpy and this helper
+    # only runs at plan time (inside complete_mix), never on the startup import
+    # graph (tests/core/test_lazy_imports.py).
+    from music_assistant.controllers.streams.smart_fades import (  # noqa: PLC0415
+        stems as stems_ducking,
+    )
+
     if not stems_ducking.available():
         return STEMS_VETO_UNAVAILABLE
     if outgoing is None:
@@ -1110,9 +1116,7 @@ class SmartDJProvider(PluginProvider):
                     item.name,
                     ANALYSIS_ATTEMPT_TIMEOUT,
                 )
-                failed[str(item.queue_item_id)] = (
-                    f"timeout after {ANALYSIS_ATTEMPT_TIMEOUT}s"
-                )
+                failed[str(item.queue_item_id)] = f"timeout after {ANALYSIS_ATTEMPT_TIMEOUT}s"
                 continue
             except Exception as err:
                 self.logger.debug("Smart DJ preroll failed for %s: %s", item.name, err)
@@ -1741,7 +1745,6 @@ class SmartDJProvider(PluginProvider):
                 requires_reload=False,
             ),
         )
-
 
     async def status(self) -> dict[str, Any]:
         """Return provider readiness without revealing credentials."""

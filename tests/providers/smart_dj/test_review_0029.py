@@ -15,11 +15,17 @@ import sqlite3
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 
+from music_assistant_models.enums import MediaType
+
 from music_assistant.controllers.streams.smart_fades.planner.assembly import (
     PlanAssembler,
 )
 from music_assistant.models.audio_analysis import AudioAnalysisData
 from music_assistant.providers.smart_dj import provider as provider_module
+from music_assistant.providers.smart_dj.engine import (
+    HardRequirementsImpossible,
+    beam_optimize,
+)
 from music_assistant.providers.smart_dj.provider import (
     STEMS_VETO_DISABLED,
     STEMS_VETO_OUTGOING_VOCAL_DOMINANCE,
@@ -40,7 +46,7 @@ def _bare_prov(tmp_path: Path) -> SmartDJProvider:
     prov.logger = logging.getLogger("smart_dj_review_test")
     prov._quick_index = QuickIndex(tmp_path / "qi.sqlite3")
     prov._quick_index.open()
-    return cast("SmartDJProvider", prov)
+    return prov
 
 
 # --- tombstone read path -----------------------------------------------------
@@ -58,9 +64,7 @@ async def test_silent_analyzer_treats_a_tombstone_as_not_analyzed() -> None:
         "Any",
         SimpleNamespace(
             get_provider=lambda *_a, **_k: None,
-            streams=SimpleNamespace(
-                audio_analysis=SimpleNamespace(get_audio_analysis=_tombstoned)
-            ),
+            streams=SimpleNamespace(audio_analysis=SimpleNamespace(get_audio_analysis=_tombstoned)),
         ),
     )
     # the gate runs BEFORE the provider lookup: a tombstoned existing analysis
@@ -82,9 +86,7 @@ async def test_analysis_ma_branch_refuses_a_tombstone() -> None:
         "Any",
         SimpleNamespace(
             get_provider=lambda *_a, **_k: None,
-            streams=SimpleNamespace(
-                audio_analysis=SimpleNamespace(get_audio_analysis=_tombstoned)
-            ),
+            streams=SimpleNamespace(audio_analysis=SimpleNamespace(get_audio_analysis=_tombstoned)),
         ),
     )
     result = await prov._analysis("x1", "prov1", None)
@@ -132,8 +134,7 @@ def test_index_open_purges_rows_from_older_versions(tmp_path: Path) -> None:
     stale["analyzer_version"] = INDEX_VERSION - 1
     conn = sqlite3.connect(tmp_path / "qi.sqlite3")
     conn.execute(
-        f"INSERT INTO track_index ({', '.join(stale)}) "
-        f"VALUES ({', '.join('?' for _ in stale)})",
+        f"INSERT INTO track_index ({', '.join(stale)}) VALUES ({', '.join('?' for _ in stale)})",
         tuple(stale.values()),
     )
     conn.commit()
@@ -159,8 +160,8 @@ async def test_mix_tracks_accepts_uris_alias(tmp_path: Path) -> None:
         captured.update(kwargs)
         return {"ok": True}
 
-    prov._resolve_track_uris = _resolve  # type: ignore[method-assign]
-    prov._mix_resolved = _mix_resolved  # type: ignore[method-assign]
+    prov._resolve_track_uris = _resolve  # type: ignore[method-assign, assignment]
+    prov._mix_resolved = _mix_resolved  # type: ignore[method-assign, assignment]
     result = await prov.mix_tracks("q1", uris=["library://track/1", "library://track/2"])
     assert result == {"ok": True}
     assert captured["response_base"]["track_uris"] == 2
@@ -187,10 +188,10 @@ async def test_rank_queue_returns_plan_failed_contract(tmp_path: Path) -> None:
 
     prov.analyze = _analyze  # type: ignore[method-assign]
 
-    real_beam = provider_module.beam_optimize
+    real_beam = beam_optimize
 
     def _impossible(*_a: Any, **_k: Any) -> None:
-        raise provider_module.HardRequirementsImpossible(
+        raise HardRequirementsImpossible(
             "Hard requirements are impossible with the current queue",
             [
                 {
@@ -204,11 +205,11 @@ async def test_rank_queue_returns_plan_failed_contract(tmp_path: Path) -> None:
             ],
         )
 
-    provider_module.beam_optimize = _impossible  # type: ignore[assignment]
+    provider_module.beam_optimize = _impossible  # type: ignore[assignment, attr-defined]
     try:
         result = await prov.rank_queue("q1")
     finally:
-        provider_module.beam_optimize = real_beam  # type: ignore[assignment]
+        provider_module.beam_optimize = real_beam  # type: ignore[attr-defined]
     assert result["plan_failed"] is True
     rows = result["hard_violations"]
     assert rows
@@ -224,18 +225,18 @@ def test_veto_override_forces_the_duck_past_thresholds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The override escape hatch beats the threshold vetoes, never the toggle."""
-    monkeypatch.setattr(
-        provider_module.stems_ducking, "available", lambda: True
+    from music_assistant.controllers.streams.smart_fades import (  # noqa: PLC0415
+        stems as stems_ducking,
     )
+
+    monkeypatch.setattr(stems_ducking, "available", lambda: True)
     dense = {"vocal_density": 0.9}
     # without override: a vocal-dense outgoing is vetoed
     assert _stems_veto_reason(dense, True) == STEMS_VETO_OUTGOING_VOCAL_DOMINANCE
     # with override: the duck runs
     assert _stems_veto_reason(dense, True, veto_override=True) is None
     # the toggle stays master: an override never forces stems ON
-    assert (
-        _stems_veto_reason(dense, False, veto_override=True) == STEMS_VETO_DISABLED
-    )
+    assert _stems_veto_reason(dense, False, veto_override=True) == STEMS_VETO_DISABLED
 
 
 # --- preroll hard timeout ------------------------------------------------------
@@ -259,7 +260,7 @@ async def test_preroll_timeout_is_recorded_as_a_failure(tmp_path: Path) -> None:
     class _Item:
         queue_item_id = "up1"
         name = "upcoming"
-        media_type = provider_module.MediaType.TRACK
+        media_type = MediaType.TRACK
 
     def _get(_queue_id: str) -> Any:
         return _Queue()
@@ -275,8 +276,8 @@ async def test_preroll_timeout_is_recorded_as_a_failure(tmp_path: Path) -> None:
             streams=SimpleNamespace(audio_analysis=SimpleNamespace(providers=[object()])),
         ),
     )
-    prov._read_full_queue = lambda _qid: [_Current(), _Item()]  # type: ignore[method-assign]
-    prov._preroll_track_analysis = _hung  # type: ignore[method-assign]
+    prov._read_full_queue = lambda _qid: [_Current(), _Item()]  # type: ignore[method-assign, assignment, misc]
+    prov._preroll_track_analysis = _hung  # type: ignore[method-assign, assignment]
     real_timeout = provider_module.ANALYSIS_ATTEMPT_TIMEOUT
     provider_module.ANALYSIS_ATTEMPT_TIMEOUT = 0.05  # type: ignore[assignment]
     try:

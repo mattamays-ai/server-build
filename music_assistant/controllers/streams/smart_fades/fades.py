@@ -19,7 +19,6 @@ from music_assistant.controllers.streams.smart_fades.filters import (
     VoiceOverMixFilter,
 )
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
-from music_assistant.controllers.streams.smart_fades import stems as stems_ducking
 from music_assistant.controllers.streams.smart_fades.models import (
     BlendPrefs,
     CrossfadeTimingInfo,
@@ -463,6 +462,14 @@ class StandardCrossFade(SmartFade):
         # the stack is unavailable the bytes come back unchanged.
         duck_task: asyncio.Task[bytes] | None = None
         if self.blend_prefs is not None and self.blend_prefs.stems:
+            # Imported here, not at module scope: stems.py pulls in numpy, and a
+            # top-level import would drag numpy onto the `import music_assistant.mass`
+            # startup graph (tests/core/test_lazy_imports.py). The module is only
+            # ever needed once a stem duck is actually requested.
+            from music_assistant.controllers.streams.smart_fades import (  # noqa: PLC0415
+                stems as stems_ducking,
+            )
+
             duck_task = asyncio.get_running_loop().create_task(
                 asyncio.to_thread(
                     stems_ducking.duck_pcm_bytes,

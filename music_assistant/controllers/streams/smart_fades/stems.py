@@ -225,8 +225,6 @@ class StemSeparator:
             del self._cache[oldest]
         return mask
 
-
-
     def _verify_model(self) -> bool:
         """Check the model file is the expected artifact before loading it."""
         if self._model_verified:
@@ -264,9 +262,7 @@ class StemSeparator:
     def _stft(wave: np.ndarray) -> np.ndarray:
         """Compute the 4-channel MDX spectrogram from a stereo window."""
         padded = np.pad(wave, ((0, 0), (0, 0), (TRIM, TRIM)))
-        frames = np.lib.stride_tricks.sliding_window_view(padded, N_FFT, axis=2)[
-            :, :, ::HOP, :
-        ]
+        frames = np.lib.stride_tricks.sliding_window_view(padded, N_FFT, axis=2)[:, :, ::HOP, :]
         spec = np.fft.rfft(frames * WINDOW.astype(np.float32), n=N_FFT, axis=-1).transpose(
             0, 1, 3, 2
         )
@@ -303,8 +299,6 @@ class StemSeparator:
         return target[:, TRIM:-TRIM]
 
 
-
-
 def duck_db_for_mask(mask: np.ndarray, duck_db: float = DEFAULT_DUCK_DB) -> float:
     """
     Scale a fixed duck depth by how much vocal energy the mask actually carries.
@@ -327,14 +321,14 @@ def duck_db_for_mask(mask: np.ndarray, duck_db: float = DEFAULT_DUCK_DB) -> floa
 _DTYPES = {16: "<i2", 24: None, 32: "<i4"}
 
 
-def pcm_bytes_to_numpy(
-    pcm: bytes, sample_rate: int, bit_depth: int, channels: int
-) -> np.ndarray | None:
+def pcm_bytes_to_numpy(pcm: bytes, bit_depth: int, channels: int) -> np.ndarray | None:
     """
     Decode little-endian interleaved PCM bytes to float32 shaped (channels, samples).
 
+    The sample rate is deliberately not a parameter: this decode is rate-agnostic,
+    the rate only matters downstream when the caller resamples the result.
+
     :param pcm: the raw PCM bytes.
-    :param sample_rate: PCM sample rate (checked, unused in the decode itself).
     :param bit_depth: 16, 24 or 32; anything else returns None.
     :param channels: only stereo (2) is supported; anything else returns None.
     :return: float32 array in the -1..1 range, or None when unsupported.
@@ -361,9 +355,7 @@ def pcm_bytes_to_numpy(
     return np.stack([data[ch::channels] for ch in range(channels)])
 
 
-def numpy_to_pcm_bytes(
-    wave: np.ndarray, bit_depth: int, channels: int
-) -> bytes | None:
+def numpy_to_pcm_bytes(wave: np.ndarray, bit_depth: int, channels: int) -> bytes | None:
     """
     Encode float32 shaped (channels, samples) back to little-endian interleaved PCM.
 
@@ -402,7 +394,7 @@ def resample_linear(wave: np.ndarray, rate_in: int, rate_out: int) -> np.ndarray
     if rate_in == rate_out:
         return wave.astype(np.float32, copy=False)
     n_in = wave.shape[1]
-    n_out = max(1, int(round(n_in * rate_out / rate_in)))
+    n_out = max(1, round(n_in * rate_out / rate_in))
     positions = np.arange(n_out) * (n_in / n_out)
     lo = np.floor(positions).astype(int)
     hi = np.minimum(lo + 1, n_in - 1)
@@ -434,7 +426,7 @@ def duck_pcm_bytes(
     if separator is None:
         separator = _SHARED_SEPARATOR
     try:
-        mix = pcm_bytes_to_numpy(pcm, sample_rate, bit_depth, channels)
+        mix = pcm_bytes_to_numpy(pcm, bit_depth, channels)
         if mix is None or mix.shape[1] < HOP:
             return pcm
         mix44 = resample_linear(mix, sample_rate, SAMPLE_RATE)
@@ -454,9 +446,7 @@ def duck_pcm_bytes(
         bins = min(spec.shape[1], mask.shape[1])
         vocal_gain = 1.0 - mask[:, :bins] * (1.0 - 10.0 ** (duck_db / 20.0))
         ducked44 = np.fft.irfft(spec[:, :bins] * vocal_gain, n=mix44.shape[1], axis=1)
-        delta = resample_linear(
-            (mix44 - ducked44).astype(np.float32), SAMPLE_RATE, sample_rate
-        )
+        delta = resample_linear((mix44 - ducked44).astype(np.float32), SAMPLE_RATE, sample_rate)
         if delta.shape[1] < mix.shape[1]:  # pad the tail after rounding
             delta = np.pad(delta, ((0, 0), (0, mix.shape[1] - delta.shape[1])))
         out = mix - delta[:, : mix.shape[1]]

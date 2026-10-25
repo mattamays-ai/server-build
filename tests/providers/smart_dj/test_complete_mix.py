@@ -44,7 +44,7 @@ def _bare_provider() -> Any:
         get_provider_instances=lambda _d: [SimpleNamespace(instance_id="spotify--x")],
         create_task=_noop_task,
     )
-    prov._read_full_queue = lambda _qid: []  # type: ignore[method-assign]
+    prov._read_full_queue = lambda _qid: []  # type: ignore[method-assign, assignment, misc]
     return prov
 
 
@@ -89,7 +89,9 @@ def test_complete_mix_survives_track_objects(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(provider, "_parse_controls", lambda *_a, **_k: DJControls())
     monkeypatch.setattr(prov_module, "_fetch_radio_tracks", fake_radio)
     monkeypatch.setattr(
-        prov_module, "build_queue_item", lambda _qid, track: SimpleNamespace(queue_item_id=track.name)
+        prov_module,
+        "build_queue_item",
+        lambda _qid, track: SimpleNamespace(queue_item_id=track.name),
     )
 
     result = asyncio.run(provider.complete_mix("queue-1", count=2))
@@ -116,7 +118,7 @@ def test_transition_report_rejects_media_objects() -> None:
 
 def test_transition_report_accepts_flattened_rows() -> None:
     """The flattened row shape complete_mix now builds is valid input."""
-    rows = [
+    rows: list[dict[str, Any]] = [
         {"name": "Seed"},
         {"name": "Radio r1", "artist": "Artist", "queue_item_id": "Radio r1", "analysis": None},
         {"name": "Radio r2", "artist": "Artist", "queue_item_id": "Radio r2", "analysis": None},
